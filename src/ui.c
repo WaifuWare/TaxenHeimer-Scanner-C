@@ -1,0 +1,283 @@
+/*
+ * Terminal UI implementation
+ */
+
+#include "ui.h"
+#include "stats.h"
+#include <stdio.h>
+#include <time.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <pthread.h>
+
+// ANSI sequences
+#define ESC "\033"
+#define CSI "\033["
+#define CLEAR_LINE CSI "2K\r"
+#define HIDE_CURSOR CSI "?25l"
+#define SHOW_CURSOR CSI "?25h"
+#define ALT_SCREEN_ON CSI "?1049h"
+#define ALT_SCREEN_OFF CSI "?1049l"
+
+// ANSI color codes
+#define COLOR_BLUE "\033[38;2;79;110;247m"
+#define COLOR_YELLOW "\033[38;2;250;233;0m"
+#define COLOR_GREEN "\033[38;2;34;197;94m"
+#define COLOR_GRAY "\033[38;2;100;116;139m"
+#define COLOR_DARK "\033[38;2;46;50;80m"
+#define COLOR_RED "\033[38;2;239;68;68m"
+#define COLOR_RESET "\033[0m"
+
+static time_t ui_start_time = 0;
+static pthread_mutex_t ui_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int ui_printing = 0;  // Flag to indicate active printing
+
+// Get terminal size
+static void get_term_size(int *w, int *h) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        *w = ws.ws_col;
+        *h = ws.ws_row;
+    } else {
+        *w = 80;
+        *h = 24;
+    }
+}
+
+
+
+void ui_init(void) {
+    ui_start_time = time(NULL);
+    printf("%s", ALT_SCREEN_ON);
+    printf("%s", HIDE_CURSOR);
+    printf("%s", CSI "?1000l");  // Disable mouse
+    printf("%s", CSI "2J");      // Clear screen
+    printf("%s", CSI "H");       // Move to home
+    fflush(stdout);
+}
+
+void ui_shutdown(void) {
+    int w, h;
+    get_term_size(&w, &h);
+    printf("%s", CSI "?1049l");  // Exit alt screen
+    printf("%s", CSI "r");       // Reset scroll region
+    printf("%s", SHOW_CURSOR);
+    printf("%s", CSI "2J");
+    printf("%s", CSI "H");
+    fflush(stdout);
+}
+
+void ui_print_banner(void) {
+    printf(COLOR_BLUE);
+    printf("╔════════════════════════════════════════╗\n");
+    printf("║      TaxenHeimer C Scanner v1.0        ║\n");
+    printf("║    Minecraft Server Scanner in C       ║\n");
+    printf("╚════════════════════════════════════════╝\n");
+    printf(COLOR_RESET "\n");
+}
+
+void ui_print_config(int threads, int subnets, int port, int timeout_ms) {
+    printf("Configuration:\n");
+    printf("  " COLOR_GRAY "Threads:" COLOR_RESET "  %d\n", threads);
+    printf("  " COLOR_GRAY "Subnets:" COLOR_RESET "  %d\n", subnets);
+    printf("  " COLOR_GRAY "Port:" COLOR_RESET "     %d\n", port);
+    printf("  " COLOR_GRAY "Timeout:" COLOR_RESET " %dms\n\n", timeout_ms);
+    printf("Press " COLOR_YELLOW "Ctrl+C" COLOR_RESET " to stop\n\n");
+}
+
+void ui_print_server(const server_info_t *info) {
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char time_str[16];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
+    pthread_mutex_lock(&ui_lock);
+    ui_printing = 1;
+    
+    // Move to end of scroll region and add newline to scroll
+    printf(CSI "999;1H");  // Move to bottom-right
+    printf("\n");
+    
+    // Print server info
+    printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_BLUE "INFO" COLOR_RESET "] ", time_str);
+    printf(COLOR_BLUE "ONLINE" COLOR_RESET " %s:%d | ", info->ip, info->port);
+    printf("Version: " COLOR_YELLOW "%s" COLOR_RESET " | ", info->version[0] ? info->version : "?");
+    printf("Protocol: %d\n", info->protocol);
+    
+    // Print MOTD
+    if (info->motd[0]) {
+        printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_BLUE "INFO" COLOR_RESET "] ", time_str);
+        printf("MOTD: " COLOR_YELLOW "%s" COLOR_RESET "\n", info->motd);
+    }
+    
+    // Print player info
+    printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_BLUE "INFO" COLOR_RESET "] ", time_str);
+    printf("Players: " COLOR_GREEN "%d/%d" COLOR_RESET, info->players.online, info->players.max);
+    
+    // Print player sample if available
+    if (info->players.sample_count > 0) {
+        printf(" | Sample: ");
+        for (int i = 0; i < info->players.sample_count; i++) {
+            if (i > 0) printf(", ");
+            printf(COLOR_YELLOW "%s" COLOR_RESET, info->players.sample[i].name);
+        }
+    }
+    printf("\n");
+    
+    fflush(stdout);
+    ui_printing = 0;
+    pthread_mutex_unlock(&ui_lock);
+}
+
+void ui_print_stats(void) {
+    uint64_t scanned, found, errors;
+    stats_get(&scanned, &found, &errors);
+    double rate = stats_get_rate();
+    
+    printf("\r" COLOR_DARK);
+    printf("Scanned: " COLOR_BLUE "%lu" COLOR_RESET " | ", scanned);
+    printf("Found: " COLOR_GREEN "%lu" COLOR_RESET " | ", found);
+    printf("Errors: " COLOR_GRAY "%lu" COLOR_RESET " | ", errors);
+    printf("Speed: " COLOR_YELLOW "%.1f ip/s" COLOR_RESET, rate);
+    printf(COLOR_RESET);
+    fflush(stdout);
+}
+
+void ui_render_header(int current_subnet, int total_subnets, int host_offset, int host_total) {
+    // Skip header update if a log is being printed
+    if (ui_printing) return;
+    
+    uint64_t scanned, found, errors;
+    stats_get(&scanned, &found, &errors);
+    
+    time_t elapsed = time(NULL) - ui_start_time;
+    double rate = elapsed > 0 ? (double)scanned / elapsed : 0.0;
+    
+    char elapsed_str[32];
+    if (elapsed < 60) {
+        snprintf(elapsed_str, sizeof(elapsed_str), "%lus", elapsed);
+    } else if (elapsed < 3600) {
+        snprintf(elapsed_str, sizeof(elapsed_str), "%.1fm", elapsed / 60.0);
+    } else {
+        snprintf(elapsed_str, sizeof(elapsed_str), "%.1fh", elapsed / 3600.0);
+    }
+    
+    int w, h;
+    get_term_size(&w, &h);
+    if (w > 120) w = 120;
+    
+    pthread_mutex_lock(&ui_lock);
+    
+    // Set scroll region: lines 8 to bottom (header is 7 lines)
+    printf(CSI "8;%dr", h);
+    
+    // Draw header at top
+    printf("%s", CSI "1;1H");  // Move to top-left
+    
+    // Separator
+    for (int i = 0; i < w; i++) printf(COLOR_DARK "-" COLOR_RESET);
+    printf("\n");
+    
+    // Title
+    printf(COLOR_BLUE "  TaxenHeimer" COLOR_RESET "  " COLOR_GRAY "Minecraft Scanner  v1.0" COLOR_RESET "\n");
+    
+    // Separator
+    for (int i = 0; i < w; i++) printf(COLOR_DARK "-" COLOR_RESET);
+    printf("\n");
+    
+    // Stats row 1
+    printf("  " COLOR_GRAY "Scanned" COLOR_RESET " " COLOR_BLUE "%8lu" COLOR_RESET "   "
+           COLOR_GRAY "Found" COLOR_RESET " " COLOR_GREEN "%8lu" COLOR_RESET "   "
+           COLOR_GRAY "Errors" COLOR_RESET " " COLOR_RED "%8lu" COLOR_RESET "\n", 
+           scanned, found, errors);
+    
+    // Stats row 2
+    printf("  " COLOR_GRAY "Speed" COLOR_RESET " " COLOR_YELLOW "%8.1f ip/s" COLOR_RESET "   "
+           COLOR_GRAY "Uptime" COLOR_RESET " " COLOR_YELLOW "%8s" COLOR_RESET "   "
+           COLOR_GRAY "Subnet" COLOR_RESET " " COLOR_BLUE "%8d/%d" COLOR_RESET "\n", 
+           rate, elapsed_str, current_subnet, total_subnets);
+    
+    // Progress bar
+    int bar_width = 24;
+    int filled = host_total > 0 ? (host_offset * bar_width) / host_total : 0;
+    printf("  " COLOR_GRAY "Progress" COLOR_RESET " [");
+    for (int i = 0; i < bar_width; i++) {
+        if (i < filled) printf(COLOR_BLUE "#" COLOR_RESET);
+        else printf(COLOR_DARK "." COLOR_RESET);
+    }
+    int pct = host_total > 0 ? (host_offset * 100) / host_total : 0;
+    printf("]  " COLOR_GRAY "%3d%%" COLOR_RESET CSI "K\n", pct);
+    
+    // Separator
+    for (int i = 0; i < w; i++) printf(COLOR_DARK "-" COLOR_RESET);
+    printf("\n");
+    
+    // Move cursor to scroll region for logs
+    printf("%s", CSI "8;1H");
+    fflush(stdout);
+    
+    pthread_mutex_unlock(&ui_lock);
+}
+
+void ui_print_summary(uint64_t scanned, uint64_t found, uint64_t errors) {
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char time_str[16];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
+    printf("\n\n");
+    printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_BLUE "INFO" COLOR_RESET "] ", time_str);
+    printf(COLOR_BLUE);
+    printf("Scan Complete!\n");
+    printf(COLOR_RESET);
+    
+    printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_BLUE "INFO" COLOR_RESET "] ", time_str);
+    printf("Total scanned: " COLOR_BLUE "%lu" COLOR_RESET "\n", scanned);
+    
+    printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_BLUE "INFO" COLOR_RESET "] ", time_str);
+    printf("Total found:   " COLOR_GREEN "%lu" COLOR_RESET "\n", found);
+    
+    printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_BLUE "INFO" COLOR_RESET "] ", time_str);
+    printf("Total errors:  " COLOR_GRAY "%lu" COLOR_RESET "\n", errors);
+    
+    if (scanned > 0) {
+        double success_rate = (double)found * 100.0 / scanned;
+        printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_BLUE "INFO" COLOR_RESET "] ", time_str);
+        printf("Success rate:  " COLOR_YELLOW "%.2f%%" COLOR_RESET "\n", success_rate);
+    }
+}
+
+void ui_log(const char *level, const char *message) {
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char time_str[16];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
+    const char *color = COLOR_GRAY;
+    if (strcmp(level, "INFO") == 0) color = COLOR_BLUE;
+    else if (strcmp(level, "WARNING") == 0) color = COLOR_YELLOW;
+    else if (strcmp(level, "ERROR") == 0) color = COLOR_RED;
+    
+    printf(COLOR_DARK "[%s]" COLOR_RESET " [%s%s" COLOR_RESET "] %s\n", 
+           time_str, color, level, message);
+}
+
+void ui_print_shutdown_message(const char *message) {
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char time_str[16];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
+    pthread_mutex_lock(&ui_lock);
+    ui_printing = 1;
+    
+    // Move to end of scroll region and add newline to scroll
+    printf(CSI "999;1H");  // Move to bottom-right
+    printf("\n");
+    
+    printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_YELLOW "WARN" COLOR_RESET "] %s\n", time_str, message);
+    fflush(stdout);
+    ui_printing = 0;
+    pthread_mutex_unlock(&ui_lock);
+}
