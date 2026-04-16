@@ -1,0 +1,24 @@
+# Build artifacts
+scanner
+*.o
+*.a
+*.so
+*.dylib
+obj/
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

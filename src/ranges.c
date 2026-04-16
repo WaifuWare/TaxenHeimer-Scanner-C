@@ -3,6 +3,41 @@
  */
 
 #include "ranges.h"
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+// Is this /16 (first two octets a.b) in a non-routable / reserved range?
+static bool is_private_slash16(uint8_t a, uint8_t b) {
+    if (a == 0) return true;                                   // 0.0.0.0/8
+    if (a == 10) return true;                                  // 10/8 RFC1918
+    if (a == 100 && b >= 64 && b <= 127) return true;          // 100.64/10 CGNAT
+    if (a == 127) return true;                                 // 127/8 loopback
+    if (a == 169 && b == 254) return true;                     // 169.254/16 link-local
+    if (a == 172 && b >= 16 && b <= 31) return true;           // 172.16/12 RFC1918
+    if (a == 192 && b == 168) return true;                     // 192.168/16 RFC1918
+    if (a == 198 && (b == 18 || b == 19)) return true;         // 198.18/15 benchmark
+    if (a >= 224) return true;                                 // 224/4 multicast + 240/4 reserved
+    return false;
+}
+
+int32_t *ranges_build_full_ipv4(int *out_count) {
+    int32_t *out = (int32_t *)malloc(sizeof(int32_t) * 65536);
+    if (!out) {
+        if (out_count) *out_count = 0;
+        return NULL;
+    }
+    int n = 0;
+    for (int a = 0; a < 256; a++) {
+        for (int b = 0; b < 256; b++) {
+            if (is_private_slash16((uint8_t)a, (uint8_t)b)) continue;
+            uint32_t subnet = ((uint32_t)a << 24) | ((uint32_t)b << 16);
+            out[n++] = (int32_t)subnet;
+        }
+    }
+    if (out_count) *out_count = n;
+    return out;
+}
 
 const int32_t KNOWN_RANGES[] = {
     1196490752, -1059979264, 579665920, 571867136, 1567424512, -2030108672, -913768448, 1419116544,

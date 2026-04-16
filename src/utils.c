@@ -6,10 +6,28 @@
 #include <stdio.h>
 #include <arpa/inet.h>
 
-// Convert int32 to IP string (optimized with bit shifting)
+static inline char *write_u8(char *p, uint8_t v) {
+    if (v >= 100) {
+        *p++ = '0' + (v / 100);
+        *p++ = '0' + ((v / 10) % 10);
+        *p++ = '0' + (v % 10);
+    } else if (v >= 10) {
+        *p++ = '0' + (v / 10);
+        *p++ = '0' + (v % 10);
+    } else {
+        *p++ = '0' + v;
+    }
+    return p;
+}
+
+// Convert int32 to IP string (manual digit conversion, no sprintf)
 void int_to_ip(uint32_t ip, char *buf) {
-    uint8_t *bytes = (uint8_t *)&ip;
-    sprintf(buf, "%u.%u.%u.%u", bytes[3], bytes[2], bytes[1], bytes[0]);
+    char *p = buf;
+    p = write_u8(p, (ip >> 24) & 0xFF); *p++ = '.';
+    p = write_u8(p, (ip >> 16) & 0xFF); *p++ = '.';
+    p = write_u8(p, (ip >> 8)  & 0xFF); *p++ = '.';
+    p = write_u8(p, ip & 0xFF);
+    *p = '\0';
 }
 
 // Convert IP string to int32

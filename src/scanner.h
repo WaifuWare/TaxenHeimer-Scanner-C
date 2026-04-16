@@ -46,4 +46,8 @@ int scan_batch_async(char ips[][16], int count, scan_callback_t callback);
 void scanner_init_pool(void);
 void scanner_cleanup_pool(void);
 
+// Wire an interrupt flag so async scan loops can abort promptly on shutdown.
+#include <signal.h>
+void scanner_set_interrupt_flag(volatile sig_atomic_t *flag);
+
 #endif // SCANNER_H

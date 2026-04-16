@@ -147,12 +147,47 @@ void ui_print_stats(void) {
 void ui_render_header(int current_subnet, int total_subnets, int host_offset, int host_total) {
     // Skip header update if a log is being printed
     if (ui_printing) return;
-    
+
     uint64_t scanned, found, errors;
     stats_get(&scanned, &found, &errors);
-    
+
     time_t elapsed = time(NULL) - ui_start_time;
-    double rate = elapsed > 0 ? (double)scanned / elapsed : 0.0;
+
+    // Instantaneous rate: scanned delta divided by wall-clock delta between
+    // refresh calls. Uses CLOCK_MONOTONIC so wall-clock jumps don't corrupt it.
+    // Exponentially smoothed with alpha=0.4 to cut single-tick jitter while
+    // still responding within ~2-3 refreshes to real rate changes.
+    static struct timespec last_ts = {0, 0};
+    static uint64_t last_scanned = 0;
+    static double smoothed_rate = 0.0;
+
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+
+    double rate = 0.0;
+    if (last_ts.tv_sec != 0 || last_ts.tv_nsec != 0) {
+        double dt = (double)(now_ts.tv_sec - last_ts.tv_sec)
+                  + (double)(now_ts.tv_nsec - last_ts.tv_nsec) / 1e9;
+        if (dt >= 0.05) {
+            uint64_t d_scanned = scanned >= last_scanned ? (scanned - last_scanned) : 0;
+            double instant = (double)d_scanned / dt;
+            if (smoothed_rate == 0.0) {
+                smoothed_rate = instant;
+            } else {
+                smoothed_rate = smoothed_rate * 0.6 + instant * 0.4;
+            }
+            rate = smoothed_rate;
+            last_ts = now_ts;
+            last_scanned = scanned;
+        } else {
+            // dt too small to trust — reuse previous smoothed value
+            rate = smoothed_rate;
+        }
+    } else {
+        // First sample — seed state, rate stays 0 for one tick
+        last_ts = now_ts;
+        last_scanned = scanned;
+    }
     
     char elapsed_str[32];
     if (elapsed < 60) {
@@ -198,16 +233,28 @@ void ui_render_header(int current_subnet, int total_subnets, int host_offset, in
            COLOR_GRAY "Subnet" COLOR_RESET " " COLOR_BLUE "%8d/%d" COLOR_RESET "\n", 
            rate, elapsed_str, current_subnet, total_subnets);
     
-    // Progress bar
-    int bar_width = 24;
-    int filled = host_total > 0 ? (host_offset * bar_width) / host_total : 0;
+    // Overall campaign progress: position across all subnets, not just current one.
+    // done = current_subnet_idx * host_total + host_offset_within_current
+    // total = total_subnets * host_total
+    int bar_width = 32;
+    long long done = 0;
+    long long total = 0;
+    if (total_subnets > 0 && host_total > 0) {
+        long long off = host_offset;
+        if (off < 0) off = 0;
+        if (off > host_total) off = host_total;
+        done  = (long long)current_subnet * host_total + off;
+        total = (long long)total_subnets * host_total;
+    }
+    int filled = total > 0 ? (int)((done * bar_width) / total) : 0;
+    if (filled > bar_width) filled = bar_width;
+    double pctd = total > 0 ? ((double)done * 100.0 / (double)total) : 0.0;
     printf("  " COLOR_GRAY "Progress" COLOR_RESET " [");
     for (int i = 0; i < bar_width; i++) {
         if (i < filled) printf(COLOR_BLUE "#" COLOR_RESET);
         else printf(COLOR_DARK "." COLOR_RESET);
     }
-    int pct = host_total > 0 ? (host_offset * 100) / host_total : 0;
-    printf("]  " COLOR_GRAY "%3d%%" COLOR_RESET CSI "K\n", pct);
+    printf("]  " COLOR_GRAY "%5.2f%%" COLOR_RESET CSI "K\n", pctd);
     
     // Separator
     for (int i = 0; i < w; i++) printf(COLOR_DARK "-" COLOR_RESET);
@@ -253,14 +300,23 @@ void ui_log(const char *level, const char *message) {
     struct tm *tm_info = localtime(&now);
     char time_str[16];
     strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
-    
+
     const char *color = COLOR_GRAY;
     if (strcmp(level, "INFO") == 0) color = COLOR_BLUE;
-    else if (strcmp(level, "WARNING") == 0) color = COLOR_YELLOW;
+    else if (strcmp(level, "WARN") == 0 || strcmp(level, "WARNING") == 0) color = COLOR_YELLOW;
     else if (strcmp(level, "ERROR") == 0) color = COLOR_RED;
-    
-    printf(COLOR_DARK "[%s]" COLOR_RESET " [%s%s" COLOR_RESET "] %s\n", 
+
+    pthread_mutex_lock(&ui_lock);
+    ui_printing = 1;
+
+    printf(CSI "999;1H");  // Move to bottom of scroll region
+    printf("\n");
+    printf(COLOR_DARK "[%s]" COLOR_RESET " [%s%s" COLOR_RESET "] %s\n",
            time_str, color, level, message);
+    fflush(stdout);
+
+    ui_printing = 0;
+    pthread_mutex_unlock(&ui_lock);
 }
 
 void ui_print_shutdown_message(const char *message) {

@@ -1,5 +1,6 @@
 {
 	"previousIP":	0,
-	"currentSubnetIdx":	520,
-	"currentHostOffset":	0
+	"currentSubnetIdx":	6,
+	"currentHostOffset":	65536,
+	"scanMode":	1
 }

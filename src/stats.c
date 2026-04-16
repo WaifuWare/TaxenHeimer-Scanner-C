@@ -55,12 +55,19 @@ double stats_get_rate(void) {
     return rate;
 }
 
-// Print statistics
+// Print statistics (single lock acquisition)
 void stats_print(void) {
     uint64_t scanned, found, errors;
-    stats_get(&scanned, &found, &errors);
-    double rate = stats_get_rate();
-    
+    double rate;
+
+    pthread_mutex_lock(&g_stats.lock);
+    scanned = g_stats.scanned;
+    found = g_stats.found;
+    errors = g_stats.errors;
+    time_t elapsed = time(NULL) - g_stats.start_time;
+    rate = elapsed > 0 ? (double)scanned / elapsed : 0.0;
+    pthread_mutex_unlock(&g_stats.lock);
+
     printf("\r\033[KScanned: %lu | Found: %lu | Errors: %lu | Speed: %.1f ip/s",
            scanned, found, errors, rate);
     fflush(stdout);

@@ -13,20 +13,10 @@ CFLAGS += -fno-strict-overflow
 LDFLAGS += -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
 
 # Aggressive optimization flags (compatible with security)
-CFLAGS += -O2 -march=native -mtune=native
-CFLAGS += -flto -ffunction-sections -fdata-sections
+CFLAGS += -O3 -march=native -mtune=native
+CFLAGS += -flto=auto -ffunction-sections -fdata-sections
 CFLAGS += -finline-functions
-LDFLAGS += -Wl,--gc-sections -Wl,-O2
-
-# Check for libcurl
-CURL_EXISTS := $(shell pkg-config --exists libcurl && echo yes)
-ifeq ($(CURL_EXISTS),yes)
-    CFLAGS += -DHAVE_CURL $(shell pkg-config --cflags libcurl)
-    LDFLAGS += $(shell pkg-config --libs libcurl)
-    $(info Building with libcurl support)
-else
-    $(info Building without libcurl - API reporting disabled)
-endif
+LDFLAGS += -flto=auto -Wl,--gc-sections -Wl,-O2
 
 TARGET = scanner
 SRCDIR = src

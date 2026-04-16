@@ -19,9 +19,11 @@
 #define NUM_THREADS 16                  // More threads for better parallelism (4x)
 #define RANGE_SCANNER_SUBNET 16         // /16 subnet size
 
-// API settings
-#define API_URL "http://localhost:8080/api/servers"
-#define MAX_CONCURRENT_API 20           // Max concurrent API requests (4x)
+// API settings (Unix domain socket IPC to Go backend)
+#define IPC_SOCKET_PATH "/tmp/taxenheimer.sock"
+#define IPC_CONNECT_TIMEOUT_MS 1000
+#define IPC_IO_TIMEOUT_MS 5000
+#define MAX_CONCURRENT_API 20           // Max concurrent IPC senders
 
 // Protocol settings
 #define PROTOCOL_VERSION 769            // Minecraft 1.21.4
