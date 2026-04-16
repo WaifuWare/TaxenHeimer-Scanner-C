@@ -5,8 +5,8 @@
 #ifndef API_H
 #define API_H
 
-#include "scanner.h"
-#include "settings.h"
+#include "scanner/scanner.h"
+#include "core/settings.h"
 #include <stdbool.h>
 
 // Initialize API client
@@ -20,6 +20,9 @@ int api_report_server(const server_info_t *info);
 
 // Flush pending batch (call on shutdown)
 void api_flush_batch(void);
+
+// Block until all in-flight batch sends complete (call after flush on shutdown).
+void api_wait_pending(void);
 
 // Check if API is available
 bool api_is_available(void);

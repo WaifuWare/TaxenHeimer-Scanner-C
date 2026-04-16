@@ -8,7 +8,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include "settings.h"
+#include "core/settings.h"
 
 // Packet buffer structure
 typedef struct {

@@ -2,9 +2,9 @@
  * Configuration implementation
  */
 
-#include "config.h"
-#include "log.h"
-#include "../libs/cJSON/cJSON.h"
+#include "core/config.h"
+#include "core/log.h"
+#include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

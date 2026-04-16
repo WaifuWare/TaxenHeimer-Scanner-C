@@ -2,9 +2,9 @@
  * API reporting implementation — Unix domain socket IPC to Go backend
  */
 
-#include "api.h"
-#include "log.h"
-#include "../libs/cJSON/cJSON.h"
+#include "net/api.h"
+#include "core/log.h"
+#include "cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +43,7 @@ static pthread_mutex_t batch_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Background flusher
 static pthread_t flusher_thread;
+static pthread_cond_t flusher_cond = PTHREAD_COND_INITIALIZER;
 static bool flusher_running = false;
 static bool flusher_stop = false;
 
@@ -57,21 +58,25 @@ static long ms_since(const struct timespec *ts) {
 
 static void *flusher_thread_func(void *arg) {
     (void)arg;
-    while (1) {
-        struct timespec req = {0, FLUSHER_TICK_MS * 1000000L};
-        nanosleep(&req, NULL);
-
-        pthread_mutex_lock(&batch_lock);
-        if (flusher_stop) {
-            pthread_mutex_unlock(&batch_lock);
-            break;
+    pthread_mutex_lock(&batch_lock);
+    while (!flusher_stop) {
+        // Timed wait — wakes on signal (shutdown) or after FLUSHER_TICK_MS.
+        struct timespec abstime;
+        clock_gettime(CLOCK_REALTIME, &abstime);
+        abstime.tv_nsec += FLUSHER_TICK_MS * 1000000L;
+        if (abstime.tv_nsec >= 1000000000L) {
+            abstime.tv_sec++;
+            abstime.tv_nsec -= 1000000000L;
         }
+        pthread_cond_timedwait(&flusher_cond, &batch_lock, &abstime);
+
+        if (flusher_stop) break;
         if (current_batch.count >= BATCH_MIN_FLUSH &&
             ms_since(&current_batch.first_added) >= BATCH_MAX_AGE_MS) {
             dispatch_current_batch_locked();
         }
-        pthread_mutex_unlock(&batch_lock);
     }
+    pthread_mutex_unlock(&batch_lock);
     return NULL;
 }
 
@@ -86,11 +91,12 @@ int api_init(void) {
     return 0;
 }
 
-// Cleanup API client
+// Cleanup API client — signals flusher to wake immediately.
 void api_cleanup(void) {
     if (!flusher_running) return;
     pthread_mutex_lock(&batch_lock);
     flusher_stop = true;
+    pthread_cond_signal(&flusher_cond);
     pthread_mutex_unlock(&batch_lock);
     pthread_join(flusher_thread, NULL);
     flusher_running = false;
@@ -240,10 +246,8 @@ static int ipc_send_batch(const char *json_str, size_t json_len) {
     return (int)(int32_t)ntohl(ack_be);
 }
 
-// Build JSON and send a batch over IPC
-static void *api_batch_thread(void *arg) {
-    batch_t *batch = (batch_t *)arg;
-
+// Build JSON from a batch and send over IPC. Returns accepted count or -1.
+static int send_batch_ipc(const batch_t *batch) {
     cJSON *root = cJSON_CreateObject();
     cJSON *servers_array = cJSON_CreateArray();
 
@@ -278,9 +282,7 @@ static void *api_batch_thread(void *arg) {
     cJSON_Delete(root);
 
     if (!json_str) {
-        free(batch);
-        api_release_slot();
-        return NULL;
+        return -1;
     }
 
     int accepted = ipc_send_batch(json_str, strlen(json_str));
@@ -291,6 +293,13 @@ static void *api_batch_thread(void *arg) {
     }
 
     free(json_str);
+    return accepted;
+}
+
+// Wrapper for background thread dispatch
+static void *api_batch_thread(void *arg) {
+    batch_t *batch = (batch_t *)arg;
+    send_batch_ipc(batch);
     free(batch);
     api_release_slot();
     return NULL;
@@ -343,9 +352,34 @@ int api_report_server(const server_info_t *info) {
     return 0;
 }
 
-// Flush pending batch (call on shutdown)
+// Flush pending batch synchronously (call on shutdown).
+// Sends inline — no detached thread, no race with program exit.
 void api_flush_batch(void) {
     pthread_mutex_lock(&batch_lock);
-    dispatch_current_batch_locked();
+    if (current_batch.count == 0) {
+        pthread_mutex_unlock(&batch_lock);
+        return;
+    }
+    // Copy batch and clear, then release lock before blocking IPC send
+    batch_t batch_copy = current_batch;
+    current_batch.count = 0;
+    memset(&current_batch.first_added, 0, sizeof(current_batch.first_added));
     pthread_mutex_unlock(&batch_lock);
+
+    log_info("Flushing %d servers synchronously...", batch_copy.count);
+    send_batch_ipc(&batch_copy);
+}
+
+// Block until all in-flight batch threads finish sending.
+void api_wait_pending(void) {
+    pthread_mutex_lock(&api_lock);
+    while (api_concurrent > 0) {
+        // Use timed wait to avoid hanging forever if a send is stuck
+        struct timespec abstime;
+        clock_gettime(CLOCK_REALTIME, &abstime);
+        abstime.tv_sec += 5;
+        int rc = pthread_cond_timedwait(&api_cond, &api_lock, &abstime);
+        if (rc != 0) break; // timeout — don't wait forever
+    }
+    pthread_mutex_unlock(&api_lock);
 }

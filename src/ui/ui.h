@@ -5,8 +5,8 @@
 #ifndef UI_H
 #define UI_H
 
-#include "stats.h"
-#include "scanner.h"
+#include "ui/stats.h"
+#include "scanner/scanner.h"
 
 // Initialize UI
 void ui_init(void);

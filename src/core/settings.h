@@ -13,10 +13,10 @@
 #define API_CONNECT_TIMEOUT_S 1
 
 // Scanning performance
-#define SCAN_BATCH 200                  // IPs per batch (doubled)
-#define IP_POOL 3000                    // IPs collected per thread iteration (2.5x)
-#define MAX_CONCURRENT_SCANS 256        // Max concurrent socket connections per batch (4x)
-#define NUM_THREADS 16                  // More threads for better parallelism (4x)
+#define SCAN_BATCH 100                  // IPs per batch
+#define IP_POOL 1000                    // IPs collected per thread iteration
+#define MAX_CONCURRENT_SCANS 128        // Max concurrent socket connections per batch
+#define NUM_THREADS 8                   // Worker threads
 #define RANGE_SCANNER_SUBNET 16         // /16 subnet size
 
 // API settings (Unix domain socket IPC to Go backend)

@@ -23,17 +23,22 @@ SRCDIR = src
 OBJDIR = obj
 LIBDIR = libs/cJSON
 
-# Source files
-SOURCES = $(SRCDIR)/main.c \
-          $(SRCDIR)/packet.c \
-          $(SRCDIR)/scanner.c \
-          $(SRCDIR)/utils.c \
-          $(SRCDIR)/stats.c \
-          $(SRCDIR)/ranges.c \
-          $(SRCDIR)/api.c \
-          $(SRCDIR)/ui.c \
-          $(SRCDIR)/config.c \
-          $(SRCDIR)/log.c \
+# Source files — organized by domain
+SOURCES = $(SRCDIR)/core/main.c \
+          $(SRCDIR)/core/config.c \
+          $(SRCDIR)/core/log.c \
+          $(SRCDIR)/scanner/scanner.c \
+          $(SRCDIR)/scanner/ranges.c \
+          $(SRCDIR)/scanner/subnet_stats.c \
+          $(SRCDIR)/scanner/dedup.c \
+          $(SRCDIR)/scanner/priority.c \
+          $(SRCDIR)/rawnet/rawscan.c \
+          $(SRCDIR)/rawnet/tcpkt.c \
+          $(SRCDIR)/protocol/packet.c \
+          $(SRCDIR)/net/api.c \
+          $(SRCDIR)/ui/ui.c \
+          $(SRCDIR)/ui/stats.c \
+          $(SRCDIR)/util/utils.c \
           $(LIBDIR)/cJSON.c
 
 # Object files
@@ -44,14 +49,8 @@ OBJECTS = $(SOURCES:%.c=$(OBJDIR)/%.o)
 
 all: $(TARGET)
 
-# Create object directory
-$(OBJDIR):
-	mkdir -p $(OBJDIR)
-	mkdir -p $(OBJDIR)/$(SRCDIR)
-	mkdir -p $(OBJDIR)/$(LIBDIR)
-
 # Link
-$(TARGET): $(OBJDIR) $(OBJECTS)
+$(TARGET): $(OBJECTS)
 	$(CC) $(OBJECTS) -o $(TARGET) $(LDFLAGS)
 	@echo "Build complete: $(TARGET)"
 
@@ -88,3 +87,12 @@ help:
 	@echo "  debug   - Build with debug symbols"
 	@echo "  install - Install to /usr/local/bin"
 	@echo "  help    - Show this help message"
+	@echo ""
+	@echo "Source layout:"
+	@echo "  src/core/      - main, config, settings, logging"
+	@echo "  src/scanner/   - scan engine, IP ranges, dedup, adaptive timeout"
+	@echo "  src/rawnet/    - kernel-bypass raw socket scanner (--raw mode)"
+	@echo "  src/protocol/  - Minecraft packet codec"
+	@echo "  src/net/       - IPC batch sender"
+	@echo "  src/ui/        - terminal UI, stats"
+	@echo "  src/util/      - IP utilities"

@@ -2,7 +2,7 @@
  * Statistics implementation
  */
 
-#include "stats.h"
+#include "ui/stats.h"
 #include <stdio.h>
 #include <string.h>
 

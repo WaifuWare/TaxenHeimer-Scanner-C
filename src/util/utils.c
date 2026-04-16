@@ -2,7 +2,7 @@
  * Utility functions implementation
  */
 
-#include "utils.h"
+#include "util/utils.h"
 #include <stdio.h>
 #include <arpa/inet.h>
 

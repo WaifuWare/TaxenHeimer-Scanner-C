@@ -2,8 +2,8 @@
  * Terminal UI implementation
  */
 
-#include "ui.h"
-#include "stats.h"
+#include "ui/ui.h"
+#include "ui/stats.h"
 #include <stdio.h>
 #include <time.h>
 #include <string.h>

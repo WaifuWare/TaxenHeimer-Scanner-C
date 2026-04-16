@@ -7,7 +7,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "settings.h"
+#include "core/settings.h"
 
 // IP conversion functions
 void int_to_ip(uint32_t ip, char *buf);

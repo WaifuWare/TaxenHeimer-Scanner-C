@@ -138,13 +138,40 @@ revert_settings() {
     fi
 }
 
+rawmode_on() {
+    need_root
+    echo "Enabling raw socket mode iptables rules..."
+    # Suppress kernel RSTs for our source port range. The userspace TCP
+    # stack manages connections — kernel RSTs would kill them.
+    if iptables -C OUTPUT -p tcp --sport 40000:48191 --tcp-flags RST RST -j DROP 2>/dev/null; then
+        echo "  iptables RST rule already present"
+    else
+        iptables -I OUTPUT -p tcp --sport 40000:48191 --tcp-flags RST RST -j DROP
+        echo "  ok   iptables RST suppression for ports 40000-48191"
+    fi
+    echo
+    echo "Run scanner with: ./scanner --raw"
+}
+
+rawmode_off() {
+    need_root
+    echo "Removing raw socket mode iptables rules..."
+    if iptables -D OUTPUT -p tcp --sport 40000:48191 --tcp-flags RST RST -j DROP 2>/dev/null; then
+        echo "  Removed RST suppression rule"
+    else
+        echo "  No rule to remove"
+    fi
+}
+
 case "${1:-}" in
-    apply)   apply_settings ;;
-    persist) persist_settings ;;
-    show)    show_settings ;;
-    revert)  revert_settings ;;
+    apply)      apply_settings ;;
+    persist)    persist_settings ;;
+    show)       show_settings ;;
+    revert)     revert_settings ;;
+    rawmode-on) rawmode_on ;;
+    rawmode-off)rawmode_off ;;
     *)
-        echo "usage: $0 {apply|persist|show|revert}"
+        echo "usage: $0 {apply|persist|show|revert|rawmode-on|rawmode-off}"
         exit 1
         ;;
 esac

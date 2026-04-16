@@ -2,8 +2,8 @@
  * Centralized logging implementation
  */
 
-#include "log.h"
-#include "ui.h"
+#include "core/log.h"
+#include "ui/ui.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdarg.h>
