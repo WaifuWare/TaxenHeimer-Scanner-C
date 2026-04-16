@@ -18,7 +18,8 @@ CFLAGS += -flto=auto -ffunction-sections -fdata-sections
 CFLAGS += -finline-functions
 LDFLAGS += -flto=auto -Wl,--gc-sections -Wl,-O2
 
-TARGET = scanner
+BUILDDIR = build
+TARGET = $(BUILDDIR)/scanner
 SRCDIR = src
 OBJDIR = obj
 LIBDIR = libs/cJSON
@@ -54,6 +55,7 @@ all: $(TARGET)
 
 # Link
 $(TARGET): $(OBJECTS)
+	@mkdir -p $(BUILDDIR)
 	$(CC) $(OBJECTS) -o $(TARGET) $(LDFLAGS)
 	@echo "Build complete: $(TARGET)"
 
@@ -64,12 +66,12 @@ $(OBJDIR)/%.o: %.c
 
 # Clean
 clean:
-	rm -rf $(OBJDIR) $(TARGET)
+	rm -rf $(OBJDIR) $(BUILDDIR)
 	@echo "Clean complete"
 
 # Run
 run: $(TARGET)
-	./$(TARGET)
+	$(TARGET)
 
 # Debug build
 debug: CFLAGS += -g -DDEBUG -O0
