@@ -1,5 +1,5 @@
 # Build artifacts
-scanner
+/scanner
 *.o
 *.a
 *.so

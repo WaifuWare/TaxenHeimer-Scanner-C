@@ -23,6 +23,13 @@ void stats_increment_scanned(void) {
     pthread_mutex_unlock(&g_stats.lock);
 }
 
+// Add N to scanned counter (batch increment for prescan thread)
+void stats_add_scanned(uint64_t n) {
+    pthread_mutex_lock(&g_stats.lock);
+    g_stats.scanned += n;
+    pthread_mutex_unlock(&g_stats.lock);
+}
+
 // Increment found counter
 void stats_increment_found(void) {
     pthread_mutex_lock(&g_stats.lock);

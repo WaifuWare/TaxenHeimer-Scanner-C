@@ -32,8 +32,11 @@ SOURCES = $(SRCDIR)/core/main.c \
           $(SRCDIR)/scanner/subnet_stats.c \
           $(SRCDIR)/scanner/dedup.c \
           $(SRCDIR)/scanner/priority.c \
+          $(SRCDIR)/scanner/hitqueue.c \
+          $(SRCDIR)/scanner/portscan.c \
           $(SRCDIR)/rawnet/rawscan.c \
           $(SRCDIR)/rawnet/tcpkt.c \
+          $(SRCDIR)/rawnet/synblast.c \
           $(SRCDIR)/protocol/packet.c \
           $(SRCDIR)/net/api.c \
           $(SRCDIR)/ui/ui.c \
@@ -91,7 +94,7 @@ help:
 	@echo "Source layout:"
 	@echo "  src/core/      - main, config, settings, logging"
 	@echo "  src/scanner/   - scan engine, IP ranges, dedup, adaptive timeout"
-	@echo "  src/rawnet/    - kernel-bypass raw socket scanner (--raw mode)"
+	@echo "  src/rawnet/    - kernel-bypass raw socket scanner (--raw/--hybrid mode)"
 	@echo "  src/protocol/  - Minecraft packet codec"
 	@echo "  src/net/       - IPC batch sender"
 	@echo "  src/ui/        - terminal UI, stats"

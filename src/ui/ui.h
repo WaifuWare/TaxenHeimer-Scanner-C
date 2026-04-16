@@ -29,6 +29,13 @@ void ui_print_stats(void);
 // Print final summary
 void ui_print_summary(uint64_t scanned, uint64_t found, uint64_t errors);
 
+// Set scan engine label shown in header ("EPOLL", "RAW", "HYBRID")
+void ui_set_engine(const char *engine);
+
+// Set prescan stats for hybrid mode header display
+void ui_set_prescan_stats(uint64_t syns_sent, uint64_t syns_failed,
+                          uint64_t rx_packets, uint64_t synacks_recv);
+
 // Render fancy header (like Nim version)
 void ui_render_header(int current_subnet, int total_subnets, int host_offset, int host_total);
 

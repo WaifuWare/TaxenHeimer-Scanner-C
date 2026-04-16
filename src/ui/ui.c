@@ -32,6 +32,11 @@
 static time_t ui_start_time = 0;
 static pthread_mutex_t ui_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int ui_printing = 0;  // Flag to indicate active printing
+static char ui_engine[16] = "EPOLL";  // scan engine label for header
+static uint64_t ui_prescan_syns = 0;
+static uint64_t ui_prescan_fails = 0;
+static uint64_t ui_prescan_rxpkts = 0;
+static uint64_t ui_prescan_acks = 0;
 
 // Get terminal size
 static void get_term_size(int *w, int *h) {
@@ -46,6 +51,19 @@ static void get_term_size(int *w, int *h) {
 }
 
 
+
+void ui_set_engine(const char *engine) {
+    strncpy(ui_engine, engine, sizeof(ui_engine) - 1);
+    ui_engine[sizeof(ui_engine) - 1] = '\0';
+}
+
+void ui_set_prescan_stats(uint64_t syns_sent, uint64_t syns_failed,
+                          uint64_t rx_packets, uint64_t synacks_recv) {
+    ui_prescan_syns = syns_sent;
+    ui_prescan_fails = syns_failed;
+    ui_prescan_rxpkts = rx_packets;
+    ui_prescan_acks = synacks_recv;
+}
 
 void ui_init(void) {
     ui_start_time = time(NULL);
@@ -204,8 +222,10 @@ void ui_render_header(int current_subnet, int total_subnets, int host_offset, in
     
     pthread_mutex_lock(&ui_lock);
     
-    // Set scroll region: lines 8 to bottom (header is 7 lines)
-    printf(CSI "8;%dr", h);
+    // Set scroll region below header. Prescan modes add 1 extra row.
+    int has_prescan = (strcmp(ui_engine, "HYBRID") == 0 || strcmp(ui_engine, "SYNBLAST") == 0);
+    int header_lines = has_prescan ? 9 : 8;
+    printf(CSI "%d;%dr", header_lines, h);
     
     // Draw header at top
     printf("%s", CSI "1;1H");  // Move to top-left
@@ -214,8 +234,12 @@ void ui_render_header(int current_subnet, int total_subnets, int host_offset, in
     for (int i = 0; i < w; i++) printf(COLOR_DARK "-" COLOR_RESET);
     printf("\n");
     
-    // Title
-    printf(COLOR_BLUE "  TaxenHeimer" COLOR_RESET "  " COLOR_GRAY "Minecraft Scanner  v1.0" COLOR_RESET "\n");
+    // Title with engine badge
+    const char *badge_color = COLOR_GRAY;
+    if (strcmp(ui_engine, "HYBRID") == 0) badge_color = COLOR_GREEN;
+    else if (strcmp(ui_engine, "RAW") == 0) badge_color = COLOR_YELLOW;
+    printf(COLOR_BLUE "  TaxenHeimer" COLOR_RESET "  " COLOR_GRAY "Minecraft Scanner  v1.0" COLOR_RESET
+           "  [%s%s" COLOR_RESET "]\n", badge_color, ui_engine);
     
     // Separator
     for (int i = 0; i < w; i++) printf(COLOR_DARK "-" COLOR_RESET);
@@ -230,8 +254,23 @@ void ui_render_header(int current_subnet, int total_subnets, int host_offset, in
     // Stats row 2
     printf("  " COLOR_GRAY "Speed" COLOR_RESET " " COLOR_YELLOW "%8.1f ip/s" COLOR_RESET "   "
            COLOR_GRAY "Uptime" COLOR_RESET " " COLOR_YELLOW "%8s" COLOR_RESET "   "
-           COLOR_GRAY "Subnet" COLOR_RESET " " COLOR_BLUE "%8d/%d" COLOR_RESET "\n", 
+           COLOR_GRAY "Subnet" COLOR_RESET " " COLOR_BLUE "%8d/%d" COLOR_RESET "\n",
            rate, elapsed_str, current_subnet, total_subnets);
+
+    // Prescan stats
+    if (strcmp(ui_engine, "HYBRID") == 0) {
+        printf("  " COLOR_GRAY "Probed" COLOR_RESET " " COLOR_BLUE "%8lu" COLOR_RESET "   "
+               COLOR_GRAY "Open" COLOR_RESET " " COLOR_GREEN "%8lu" COLOR_RESET "   "
+               COLOR_GRAY "Hit%%" COLOR_RESET " " COLOR_YELLOW "%7.4f%%" COLOR_RESET "\n",
+               ui_prescan_syns, ui_prescan_acks,
+               ui_prescan_syns > 0 ? (double)ui_prescan_acks * 100.0 / (double)ui_prescan_syns : 0.0);
+    } else if (strcmp(ui_engine, "SYNBLAST") == 0) {
+        printf("  " COLOR_GRAY "SYNs" COLOR_RESET " " COLOR_BLUE "%8lu" COLOR_RESET
+               "  " COLOR_GRAY "TX-err" COLOR_RESET " " COLOR_RED "%lu" COLOR_RESET
+               "  " COLOR_GRAY "RX-pkts" COLOR_RESET " " COLOR_YELLOW "%lu" COLOR_RESET
+               "  " COLOR_GRAY "SYN-ACKs" COLOR_RESET " " COLOR_GREEN "%lu" COLOR_RESET "\n",
+               ui_prescan_syns, ui_prescan_fails, ui_prescan_rxpkts, ui_prescan_acks);
+    }
     
     // Overall campaign progress: position across all subnets, not just current one.
     // done = current_subnet_idx * host_total + host_offset_within_current
@@ -261,7 +300,7 @@ void ui_render_header(int current_subnet, int total_subnets, int host_offset, in
     printf("\n");
     
     // Move cursor to scroll region for logs
-    printf("%s", CSI "8;1H");
+    printf(CSI "%d;1H", header_lines);
     fflush(stdout);
     
     pthread_mutex_unlock(&ui_lock);

@@ -71,8 +71,10 @@ static void *flusher_thread_func(void *arg) {
         pthread_cond_timedwait(&flusher_cond, &batch_lock, &abstime);
 
         if (flusher_stop) break;
-        if (current_batch.count >= BATCH_MIN_FLUSH &&
-            ms_since(&current_batch.first_added) >= BATCH_MAX_AGE_MS) {
+        // Flush when: batch is full enough, OR any batch has aged past max
+        if (current_batch.count > 0 &&
+            (current_batch.count >= BATCH_MIN_FLUSH ||
+             ms_since(&current_batch.first_added) >= BATCH_MAX_AGE_MS)) {
             dispatch_current_batch_locked();
         }
     }
@@ -184,7 +186,10 @@ static int read_all(int fd, void *buf, size_t n) {
 // Returns the server-reported success count on success, or -1 on transport failure.
 static int ipc_send_batch(const char *json_str, size_t json_len) {
     int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sfd < 0) return -1;
+    if (sfd < 0) {
+        log_error("IPC socket() failed: %s (fd exhaustion?)", strerror(errno));
+        return -1;
+    }
 
     struct timeval tv_io;
     tv_io.tv_sec = IPC_IO_TIMEOUT_MS / 1000;
@@ -354,6 +359,7 @@ int api_report_server(const server_info_t *info) {
 
 // Flush pending batch synchronously (call on shutdown).
 // Sends inline — no detached thread, no race with program exit.
+// Retries once on failure (Go backend may still be shutting down from same SIGINT).
 void api_flush_batch(void) {
     pthread_mutex_lock(&batch_lock);
     if (current_batch.count == 0) {
@@ -367,7 +373,23 @@ void api_flush_batch(void) {
     pthread_mutex_unlock(&batch_lock);
 
     log_info("Flushing %d servers synchronously...", batch_copy.count);
-    send_batch_ipc(&batch_copy);
+    int accepted = send_batch_ipc(&batch_copy);
+
+    if (accepted < 0) {
+        // Retry once after short delay — backend may not have finished processing
+        usleep(500 * 1000);
+        log_info("Retrying flush...");
+        accepted = send_batch_ipc(&batch_copy);
+    }
+
+    // Print to stderr so it survives TUI alt-screen cleanup
+    if (accepted >= 0) {
+        fprintf(stderr, "[flush] %d/%d servers sent to backend\n",
+                accepted, batch_copy.count);
+    } else {
+        fprintf(stderr, "[flush] FAILED to send %d servers — backend unreachable\n",
+                batch_copy.count);
+    }
 }
 
 // Block until all in-flight batch threads finish sending.
