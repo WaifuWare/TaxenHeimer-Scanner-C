@@ -5,6 +5,7 @@ build/
 *.so
 *.dylib
 obj/
+config.json
 
 # Debug files
 *.dSYM/
