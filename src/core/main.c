@@ -190,12 +190,17 @@ static void *hybrid_worker_thread(void *arg) {
     return NULL;
 }
 
-// Signal handler
+// Signal handler. Must call only async-signal-safe functions — POSIX lists
+// write() as safe but printf/fflush/pthread_mutex_lock are NOT. The prior
+// version called ui_print_shutdown_message which grabs a mutex and runs
+// stdio; delivering SIGINT while any other thread held that mutex deadlocked
+// the process. Here we just flip the flag and emit a fixed banner via
+// write(); the main thread shows the friendly shutdown message.
 static void signal_handler(int signum) {
-    if (signum == SIGINT) {
-        interrupted = 1;
-        ui_print_shutdown_message("Received interrupt signal, shutting down...");
-    }
+    (void)signum;
+    interrupted = 1;
+    static const char msg[] = "\n[shutting down]\n";
+    (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
 }
 
 // Scanner thread function
@@ -277,35 +282,39 @@ static void *scanner_thread(void *arg) {
 }
 
 int main(int argc, char **argv) {
-    // Parse CLI
+    // Parse CLI. Scan mode is runtime-only now: pass -f each run for full
+    // IPv4; absence selects the known-ranges list. There is no persisted
+    // "current mode" — each mode keeps its own resume cursor in config.json.
     bool cli_full = false;
-    bool cli_known = false;
     bool cli_raw = false;
     bool cli_hybrid = false;
     bool cli_synblast = false;
+    bool cli_log_only = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--full") == 0 || strcmp(argv[i], "-f") == 0) {
             cli_full = true;
-        } else if (strcmp(argv[i], "--known") == 0 || strcmp(argv[i], "-k") == 0) {
-            cli_known = true;
         } else if (strcmp(argv[i], "--raw") == 0 || strcmp(argv[i], "-r") == 0) {
             cli_raw = true;
         } else if (strcmp(argv[i], "--hybrid") == 0 || strcmp(argv[i], "-H") == 0) {
             cli_hybrid = true;
         } else if (strcmp(argv[i], "--synblast") == 0 || strcmp(argv[i], "-S") == 0) {
             cli_synblast = true;
+        } else if (strcmp(argv[i], "--log-only") == 0 || strcmp(argv[i], "-l") == 0) {
+            cli_log_only = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("Options:\n");
-            printf("  -k, --known      Scan only known Minecraft /16 subnets (default)\n");
-            printf("  -f, --full       Scan the entire routable IPv4 space\n");
+            printf("  -f, --full       Scan the entire routable IPv4 space (default: known /16s)\n");
             printf("  -r, --raw        Use raw sockets (bypass kernel TCP, needs CAP_NET_RAW)\n");
             printf("  -H, --hybrid     Fast connect prescan + kernel TCP SLP (works behind NAT)\n");
             printf("  -S, --synblast   Raw SYN prescan + kernel TCP SLP (needs public IP + CAP_NET_RAW)\n");
+            printf("  -l, --log-only   Disable TUI; emit plain timestamped log lines (auto when stdout is not a TTY)\n");
             printf("  -h, --help       Show this help\n");
             return 0;
         }
     }
+
+    if (cli_log_only) ui_set_log_only(1);
 
     // Raise file descriptor limit — hybrid/synblast modes need many concurrent FDs
     struct rlimit rl;
@@ -314,8 +323,14 @@ int main(int argc, char **argv) {
         setrlimit(RLIMIT_NOFILE, &rl);
     }
 
-    // Setup signal handler
+    // Setup signal handlers
+    // SIGPIPE: silently ignore. A scanned server RSTing mid-send, or the Go
+    // backend disappearing, would otherwise kill the process outright with
+    // no log. Individual write() calls still return EPIPE which the callers
+    // already handle.
+    signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
 
     // Wire interrupt flag into scanner so async loops abort on shutdown
     scanner_set_interrupt_flag(&interrupted);
@@ -323,18 +338,11 @@ int main(int argc, char **argv) {
     // Load config
     g_config = config_load();
 
-    // Apply CLI mode override. Reset scan position on mode change so we don't
-    // reuse an index from the wrong subnet array.
-    scan_mode_t desired_mode = g_config.scan_mode;
-    if (cli_full)  desired_mode = SCAN_MODE_FULL_IPV4;
-    if (cli_known) desired_mode = SCAN_MODE_KNOWN;
-    if (desired_mode != g_config.scan_mode) {
-        log_info("Scan mode changed — resetting scan position");
-        g_config.scan_mode = desired_mode;
-        g_config.current_subnet_idx = 0;
-        g_config.current_host_offset = 0;
-        config_save(&g_config);
-    }
+    // Scan mode is chosen per-run; config.json stores separate resume cursors
+    // for known vs full so flipping between them doesn't lose either.
+    scan_mode_t desired_mode = cli_full ? SCAN_MODE_FULL_IPV4 : SCAN_MODE_KNOWN;
+    int     cfg_subnet_idx   = (desired_mode == SCAN_MODE_FULL_IPV4) ? g_config.full_subnet_idx    : g_config.known_subnet_idx;
+    int32_t cfg_host_offset  = (desired_mode == SCAN_MODE_FULL_IPV4) ? g_config.full_host_offset   : g_config.known_host_offset;
 
     // Initialize socket pool
     scanner_init_pool();
@@ -400,7 +408,7 @@ int main(int argc, char **argv) {
     int subnet_count = 0;
     int32_t *subnets = NULL;
 
-    if (g_config.scan_mode == SCAN_MODE_FULL_IPV4) {
+    if (desired_mode == SCAN_MODE_FULL_IPV4) {
         subnets = ranges_build_full_ipv4(&subnet_count);
         if (!subnets || subnet_count == 0) {
             log_error("Failed to build full IPv4 range list");
@@ -418,14 +426,16 @@ int main(int argc, char **argv) {
     // Load saved priority data and apply initial reorder
     priority_load();
 
-    // Clamp resume position to new subnet count
-    if (g_config.current_subnet_idx >= subnet_count) {
-        g_config.current_subnet_idx = 0;
-        g_config.current_host_offset = 0;
+    // Clamp resume position to current subnet count (mode's list may have
+    // shrunk between runs — reset cleanly rather than scanning phantom
+    // entries).
+    if (cfg_subnet_idx >= subnet_count || cfg_subnet_idx < 0) {
+        cfg_subnet_idx = 0;
+        cfg_host_offset = 0;
     }
 
     // Set initial subnet from config
-    current_subnet_idx = g_config.current_subnet_idx;
+    current_subnet_idx = cfg_subnet_idx;
 
     // Spread worker threads across all available CPU cores
     int ncpus = sysconf(_SC_NPROCESSORS_ONLN);
@@ -443,7 +453,7 @@ int main(int argc, char **argv) {
         thread_args[0].subnets = subnets;
         thread_args[0].subnet_count = subnet_count;
         thread_args[0].thread_id = 0;
-        thread_args[0].start_host_offset = g_config.current_host_offset;
+        thread_args[0].start_host_offset = cfg_host_offset;
 
         if (pthread_create(&threads[0], NULL, prescan_thread, &thread_args[0]) != 0) {
             log_error("Failed to create prescan thread");
@@ -473,7 +483,7 @@ int main(int argc, char **argv) {
             thread_args[i].subnets = subnets;
             thread_args[i].subnet_count = subnet_count;
             thread_args[i].thread_id = i;
-            thread_args[i].start_host_offset = g_config.current_host_offset + i;
+            thread_args[i].start_host_offset = cfg_host_offset + i;
 
             if (pthread_create(&threads[i], NULL, scanner_thread, &thread_args[i]) != 0) {
                 log_error("Failed to create thread %d", i);
@@ -524,13 +534,22 @@ int main(int argc, char **argv) {
                         current_host_offset, 1 << RANGE_SCANNER_SUBNET);
         pthread_mutex_unlock(&subnet_lock);
 
-        // Save config every 30 seconds (60 ticks * 500ms)
+        // Save config every 30 seconds (60 ticks * 500ms). Writes only the
+        // cursor for the mode we're currently running so the other mode's
+        // resume position stays untouched.
         if (++save_counter >= 60) {
             save_counter = 0;
             pthread_mutex_lock(&subnet_lock);
-            g_config.current_subnet_idx = current_subnet_idx;
-            g_config.current_host_offset = current_host_offset;
+            int     snap_idx = current_subnet_idx;
+            int32_t snap_off = current_host_offset;
             pthread_mutex_unlock(&subnet_lock);
+            if (desired_mode == SCAN_MODE_FULL_IPV4) {
+                g_config.full_subnet_idx  = snap_idx;
+                g_config.full_host_offset = snap_off;
+            } else {
+                g_config.known_subnet_idx  = snap_idx;
+                g_config.known_host_offset = snap_off;
+            }
             config_save(&g_config);
         }
     }
@@ -556,11 +575,18 @@ int main(int argc, char **argv) {
     uint64_t scanned, found, errors;
     stats_get(&scanned, &found, &errors);
     
-    // Save final config
+    // Save final config for the mode we just ran.
     pthread_mutex_lock(&subnet_lock);
-    g_config.current_subnet_idx = current_subnet_idx;
-    g_config.current_host_offset = current_host_offset;
+    int     final_idx = current_subnet_idx;
+    int32_t final_off = current_host_offset;
     pthread_mutex_unlock(&subnet_lock);
+    if (desired_mode == SCAN_MODE_FULL_IPV4) {
+        g_config.full_subnet_idx  = final_idx;
+        g_config.full_host_offset = final_off;
+    } else {
+        g_config.known_subnet_idx  = final_idx;
+        g_config.known_host_offset = final_off;
+    }
     config_save(&g_config);
     
     ui_print_summary(scanned, found, errors);

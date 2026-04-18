@@ -397,10 +397,15 @@ int synblast_prescan(char ips[][16], int count, hit_queue_t *queue) {
         }
 
         // ── RX phase: wait for remaining SYN-ACKs ──
-        uint64_t deadline = mono_ms() + SYN_RX_TIMEOUT;
-        while (mono_ms() < deadline && !blast_interrupted()) {
+        // Cache mono_ms between poll() returns — it only needs to advance
+        // after a wake-up, so one clock_gettime per poll iteration instead
+        // of three (prior code called it in the while cond, remaining calc,
+        // and the loop bottom).
+        uint64_t now_ms = mono_ms();
+        uint64_t deadline = now_ms + SYN_RX_TIMEOUT;
+        while (now_ms < deadline && !blast_interrupted()) {
             struct pollfd pfd = { .fd = rx_fd, .events = POLLIN };
-            long remaining = (long)(deadline - mono_ms());
+            long remaining = (long)(deadline - now_ms);
             if (remaining <= 0) break;
             int pr = poll(&pfd, 1, remaining > 50 ? 50 : (int)remaining);
             if (pr > 0) {
@@ -408,6 +413,7 @@ int synblast_prescan(char ips[][16], int count, hit_queue_t *queue) {
                 g_synacks_recv += (uint64_t)drained;
                 total_hits += drained;
             }
+            now_ms = mono_ms();
         }
 
         // ── Push responsive IPs to worker queue ──

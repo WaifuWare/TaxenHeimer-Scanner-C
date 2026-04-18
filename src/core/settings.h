@@ -20,7 +20,7 @@
 #define RANGE_SCANNER_SUBNET 16         // /16 subnet size
 
 // API settings (Unix domain socket IPC to Go backend)
-#define IPC_SOCKET_PATH "/tmp/taxenheimer.sock"
+#define IPC_SOCKET_PATH "/tmp/taxenheimer/ipc.sock"
 #define IPC_CONNECT_TIMEOUT_MS 1000
 #define IPC_IO_TIMEOUT_MS 5000
 #define MAX_CONCURRENT_API 20           // Max concurrent IPC senders

@@ -39,19 +39,40 @@ uint32_t ip_to_int(const char *ip) {
     return 0;
 }
 
-// Check if IP is valid (not private) - optimized with bit masking
+// Check if IP is valid (not private/reserved/special-use). Returns false for
+// any address the scanner must never probe. Each branch covers an IANA-
+// assigned range that isn't a legitimate Minecraft target and that generates
+// abuse complaints or hits internal infrastructure when scanned. Keep all of
+// these in sync with ranges.c / Go backend's isPublicUnicastIP.
 bool check_valid_ip(uint32_t ip) {
-    // Check 10.0.0.0/8 (10.0.0.0 - 10.255.255.255)
-    if ((ip & 0xFF000000) == 0x0A000000) return false;
-    
-    // Check 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
-    if ((ip & 0xFFF00000) == 0xAC100000) return false;
-    
-    // Check 192.168.0.0/16 (192.168.0.0 - 192.168.255.255)
-    if ((ip & 0xFFFF0000) == 0xC0A80000) return false;
-    
-    // Check 169.254.0.0/16 (169.254.0.0 - 169.254.255.255)
+    uint8_t a = (ip >> 24) & 0xFF;
+
+    // 0.0.0.0/8 — "this network"
+    if (a == 0) return false;
+    // 10.0.0.0/8 — RFC1918
+    if (a == 10) return false;
+    // 127.0.0.0/8 — loopback
+    if (a == 127) return false;
+    // 100.64.0.0/10 — CGNAT
+    if ((ip & 0xFFC00000) == 0x64400000) return false;
+    // 169.254.0.0/16 — link-local
     if ((ip & 0xFFFF0000) == 0xA9FE0000) return false;
-    
+    // 172.16.0.0/12 — RFC1918
+    if ((ip & 0xFFF00000) == 0xAC100000) return false;
+    // 192.0.0.0/24 — IETF protocol assignments
+    if ((ip & 0xFFFFFF00) == 0xC0000000) return false;
+    // 192.0.2.0/24 — TEST-NET-1
+    if ((ip & 0xFFFFFF00) == 0xC0000200) return false;
+    // 192.168.0.0/16 — RFC1918
+    if ((ip & 0xFFFF0000) == 0xC0A80000) return false;
+    // 198.18.0.0/15 — benchmark
+    if ((ip & 0xFFFE0000) == 0xC6120000) return false;
+    // 198.51.100.0/24 — TEST-NET-2
+    if ((ip & 0xFFFFFF00) == 0xC6336400) return false;
+    // 203.0.113.0/24 — TEST-NET-3
+    if ((ip & 0xFFFFFF00) == 0xCB007100) return false;
+    // 224.0.0.0/4 — multicast; 240.0.0.0/4 — reserved; includes 255.255.255.255
+    if (a >= 224) return false;
+
     return true;
 }

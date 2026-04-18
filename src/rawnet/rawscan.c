@@ -20,7 +20,6 @@
 #include "protocol/packet.h"
 #include "core/settings.h"
 #include "core/log.h"
-#include "cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -181,12 +180,8 @@ static int try_parse_slp(conn_t *c, server_info_t *info) {
     if (r <= 0) return r < 0 ? -1 : 0;
     pos += (size_t)consumed;
     if (json_len <= 0 || (size_t)json_len > body_end - pos) return -1;
-    char *tmp = malloc((size_t)json_len + 1);
-    if (!tmp) return -1;
-    memcpy(tmp, c->rx_buf + pos, (size_t)json_len);
-    tmp[json_len] = '\0';
-    int ok = parse_server_json(tmp, info);
-    free(tmp);
+    // parse directly in-place — no per-packet malloc
+    int ok = parse_server_json_n((const char *)(c->rx_buf + pos), (size_t)json_len, info);
     return ok ? 1 : -1;
 }
 
@@ -248,6 +243,9 @@ static void rx_process(const uint8_t *pkt, int pkt_len, scan_callback_t callback
     if (ip->daddr != local_ip) return;
 
     int ip_hdr_len = ip->ihl * 4;
+    // ihl is a 4-bit field; attacker can send ihl<5 which puts the TCP header
+    // inside the declared IP options region and confuses later offsets.
+    if (ip_hdr_len < (int)sizeof(struct iphdr)) return;
     if (pkt_len < ip_hdr_len + (int)sizeof(struct tcphdr)) return;
 
     const struct tcphdr *tcp = (const struct tcphdr *)(pkt + ip_hdr_len);
@@ -266,7 +264,12 @@ static void rx_process(const uint8_t *pkt, int pkt_len, scan_callback_t callback
     uint32_t their_seq = ntohl(tcp->seq);
     uint32_t their_ack = ntohl(tcp->ack_seq);
     int tcp_hdr_len = tcp->doff * 4;
+    // A spoofed packet with doff=15 but short pkt_len would make data_off
+    // exceed pkt_len, producing a negative data_len that, cast to size_t,
+    // becomes a ~4 GB memcpy into c->rx_buf. Bound header length up-front.
+    if (tcp_hdr_len < (int)sizeof(struct tcphdr)) return;
     int data_off = ip_hdr_len + tcp_hdr_len;
+    if (data_off > pkt_len) return;
     int data_len = pkt_len - data_off;
 
     if (tcp->rst) {
@@ -298,7 +301,10 @@ static void rx_process(const uint8_t *pkt, int pkt_len, scan_callback_t callback
     }
 
     if (c->state == CS_ESTABLISHED && data_len > 0) {
-        if (c->rx_len + data_len <= CONN_RX_CAP) {
+        // Belt-and-suspenders: even after the bounds above, use size_t math
+        // for the capacity check so a future refactor that loosens the entry
+        // checks can't regress to a signed-overflow overflow.
+        if ((size_t)c->rx_len + (size_t)data_len <= (size_t)CONN_RX_CAP) {
             memcpy(c->rx_buf + c->rx_len, pkt + data_off, (size_t)data_len);
             c->rx_len += data_len;
         }
@@ -315,6 +321,7 @@ static void rx_process(const uint8_t *pkt, int pkt_len, scan_callback_t callback
         server_info_t info;
         memset(&info, 0, sizeof(info));
         memcpy(info.ip, c->ip_str, 16);
+        info.ip_u32 = ntohl(c->dst_ip);
         info.port = c->dst_port;
 
         int pr = try_parse_slp(c, &info);
@@ -337,6 +344,7 @@ static void rx_process(const uint8_t *pkt, int pkt_len, scan_callback_t callback
         server_info_t info;
         memset(&info, 0, sizeof(info));
         memcpy(info.ip, c->ip_str, 16);
+        info.ip_u32 = ntohl(c->dst_ip);
         info.port = c->dst_port;
         try_parse_slp(c, &info);
         if (info.success && callback) callback(&info);
@@ -366,6 +374,7 @@ static void expire_timeouts(uint64_t now, scan_callback_t callback) {
                 server_info_t info;
                 memset(&info, 0, sizeof(info));
                 memcpy(info.ip, c->ip_str, 16);
+                info.ip_u32 = ntohl(c->dst_ip);
                 info.port = c->dst_port;
                 info.success = false;
                 if (callback) callback(&info);
@@ -391,6 +400,7 @@ static void expire_timeouts(uint64_t now, scan_callback_t callback) {
                 server_info_t info;
                 memset(&info, 0, sizeof(info));
                 memcpy(info.ip, c->ip_str, 16);
+                info.ip_u32 = ntohl(c->dst_ip);
                 info.port = c->dst_port;
                 info.success = false;
                 if (callback) callback(&info);
@@ -541,18 +551,24 @@ int rawscan_batch(char ips[][16], int count, scan_callback_t callback) {
     while ((next_ip < count || atomic_load(&in_flight_count) > 0) && !raw_interrupted()) {
         // ── TX phase: fill free slots with SYNs ──
         int sent = 0;
+        // Cache a single clock sample for this TX burst — every connection
+        // sent in the same batch shares the same monotonic "now", which is
+        // what the TX→ACK deadline actually cares about. Saves TX_BATCH-1
+        // clock_gettime syscalls (x2: seq + deadline) per burst.
+        uint64_t tx_now = 0;
         while (next_ip < count && sent < TX_BATCH && !raw_interrupted()) {
             int idx = fl_pop();
             if (idx < 0) break;
+            if (sent == 0) tx_now = mono_ms();
 
             conn_t *c = &conns[idx];
             uint32_t dst = ip_addrs[next_ip];
             c->dst_ip    = dst;
             c->dst_port  = MINECRAFT_PORT;
-            c->our_seq   = (uint32_t)mono_ms() ^ ((uint32_t)idx << 16);
+            c->our_seq   = (uint32_t)tx_now ^ ((uint32_t)idx << 16);
             c->rx_len    = 0;
             c->timeout_ms = (uint16_t)subnet_stats_get_timeout(ntohl(dst));
-            c->deadline_ms = mono_ms() + (uint64_t)c->timeout_ms;
+            c->deadline_ms = tx_now + (uint64_t)c->timeout_ms;
 
             // Pre-format IP string + MC payload at connection start
             inet_ntop(AF_INET, &dst, c->ip_str, sizeof(c->ip_str));
@@ -590,6 +606,7 @@ int rawscan_batch(char ips[][16], int count, scan_callback_t callback) {
             server_info_t info;
             memset(&info, 0, sizeof(info));
             memcpy(info.ip, conns[i].ip_str, 16);
+            info.ip_u32 = ntohl(conns[i].dst_ip);
             info.port = conns[i].dst_port;
             info.success = false;
             if (callback) callback(&info);

@@ -8,6 +8,13 @@
 #include "ui/stats.h"
 #include "scanner/scanner.h"
 
+// Enable log-only mode: no alt-screen, no ANSI, no cursor moves. Plain
+// timestamped lines written to stdout. Suitable for `journalctl -fu ...`
+// where ANSI escapes and the TUI header garble the output. Call BEFORE
+// ui_init(). Auto-enabled when stdout is not a TTY.
+void ui_set_log_only(int enabled);
+int  ui_is_log_only(void);
+
 // Initialize UI
 void ui_init(void);
 

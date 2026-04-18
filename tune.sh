@@ -42,12 +42,36 @@ declare -a SETTINGS=(
     # Raise max file descriptors system-wide.
     "fs.file-max=2097152"
 
-    # Netfilter conntrack ceiling — only matters if conntrack module is loaded.
-    # Scanner creates one conntrack entry per scanned IP.
-    "net.netfilter.nf_conntrack_max=524288"
+    # Netfilter conntrack ceiling — only matters if conntrack module is
+    # loaded. Scanner creates one conntrack entry per scanned IP. A busy
+    # scan with raw-SYN prescan can peak at 500k+ simultaneously, which
+    # collides with the default ~250k ceiling; when it fills the kernel
+    # starts dropping/resetting *other* TCP flows on the host — notably
+    # long-lived HTTPS keep-alives to login.microsoftonline.com used by
+    # the backend's MS/Minecraft auth. 1M is a safe ceiling on any host
+    # with >=2 GB RAM (~300 B per conntrack entry).
+    "net.netfilter.nf_conntrack_max=1048576"
+
+    # Resize the conntrack hash table to roughly 1/4 of max so lookups
+    # stay O(1)-ish. Only settable on newer kernels via sysctl; older
+    # kernels require a module param (apply_settings skips it gracefully).
+    "net.netfilter.nf_conntrack_buckets=262144"
 
     # Lower conntrack TIME_WAIT so entries expire quickly.
     "net.netfilter.nf_conntrack_tcp_timeout_time_wait=30"
+
+    # TCP keep-alive shortened so the backend notices dead MS / Mojang
+    # HTTPS sockets before reusing them and eating an RST. Default is
+    # 2h/75s/9 → ~15 min before a dead flow is detected; we cut that to
+    # ~1.5 min which matches our idle-conn timeout in the Go client.
+    "net.ipv4.tcp_keepalive_time=60"
+    "net.ipv4.tcp_keepalive_intvl=10"
+    "net.ipv4.tcp_keepalive_probes=3"
+
+    # Retransmit a lost packet fewer times before giving up — default
+    # is ~15 retries (~15 min). Scanner wants to know quickly when a
+    # conn is dead.
+    "net.ipv4.tcp_retries2=5"
 
     # Larger socket buffers — helps parallel recv throughput.
     "net.core.rmem_max=16777216"
@@ -55,6 +79,10 @@ declare -a SETTINGS=(
 
     # Backlog for incoming packets (not critical for scanner, but cheap).
     "net.core.netdev_max_backlog=16384"
+
+    # Listen-queue ceiling. Systemd defaults to 4096, some distros 128;
+    # raise to match backlog so short bursts don't drop.
+    "net.core.somaxconn=4096"
 )
 
 apply_settings() {

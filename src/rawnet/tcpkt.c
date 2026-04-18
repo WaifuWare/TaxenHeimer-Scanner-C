@@ -180,7 +180,10 @@ int tcpkt_get_local_ip(uint32_t *out_ip, char *ifname, size_t ifname_len) {
     while (fgets(line, sizeof(line), f)) {
         char iface[IF_NAMESIZE];
         unsigned long dest, gw, flags;
-        if (sscanf(line, "%s %lx %lx %lx", iface, &dest, &gw, &flags) < 4) continue;
+        // %15s matches IFNAMSIZ-1 to prevent stack overflow if /proc is
+        // ever tampered with. Linux kernel enforces 15-byte iface names, so
+        // this is defence-in-depth rather than a live vulnerability.
+        if (sscanf(line, "%15s %lx %lx %lx", iface, &dest, &gw, &flags) < 4) continue;
         if (dest == 0 && (flags & 0x2)) { // UG = gateway
             strncpy(best_iface, iface, IF_NAMESIZE - 1);
             found = 1;

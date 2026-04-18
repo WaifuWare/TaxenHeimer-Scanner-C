@@ -4,6 +4,7 @@
 
 #include "ui/ui.h"
 #include "ui/stats.h"
+#include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
 #include <string.h>
@@ -38,6 +39,41 @@ static uint64_t ui_prescan_fails = 0;
 static uint64_t ui_prescan_rxpkts = 0;
 static uint64_t ui_prescan_acks = 0;
 
+// Log-only mode: disables ANSI, alt-screen, cursor moves, periodic header
+// redraws. Enabled explicitly via --log-only, implicitly when stdout is
+// not a TTY (e.g. systemd journal, tee, file redirect). In that mode every
+// print goes out as a single `[TIME] [LEVEL] message\n` line suitable for
+// line-buffered log consumers.
+static int ui_log_only = 0;
+
+void ui_set_log_only(int enabled) { ui_log_only = enabled ? 1 : 0; }
+int  ui_is_log_only(void)         { return ui_log_only; }
+
+// timestamp buffer helper used by every log path.
+static void fmt_time(char *out, size_t outlen) {
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    localtime_r(&now, &tm_buf);
+    strftime(out, outlen, "%Y-%m-%d %H:%M:%S", &tm_buf);
+}
+
+// Plain log line, no ANSI. Locked so concurrent log_info/ui_print_server
+// don't interleave.
+static void plain_log(const char *level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void plain_log(const char *level, const char *fmt, ...) {
+    char ts[32];
+    fmt_time(ts, sizeof(ts));
+    pthread_mutex_lock(&ui_lock);
+    fprintf(stdout, "[%s] [%s] ", ts, level);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stdout, fmt, ap);
+    va_end(ap);
+    fputc('\n', stdout);
+    fflush(stdout);
+    pthread_mutex_unlock(&ui_lock);
+}
+
 // Get terminal size
 static void get_term_size(int *w, int *h) {
     struct winsize ws;
@@ -67,6 +103,17 @@ void ui_set_prescan_stats(uint64_t syns_sent, uint64_t syns_failed,
 
 void ui_init(void) {
     ui_start_time = time(NULL);
+    // Auto-enable log-only when stdout isn't a TTY (pipe, journald, file).
+    if (!ui_log_only && !isatty(STDOUT_FILENO)) {
+        ui_log_only = 1;
+    }
+    if (ui_log_only) {
+        // Line-buffered stdout so each log line flushes on \n even when
+        // journald captures the pipe.
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        plain_log("INFO", "scanner starting (log-only mode)");
+        return;
+    }
     printf("%s", ALT_SCREEN_ON);
     printf("%s", HIDE_CURSOR);
     printf("%s", CSI "?1000l");  // Disable mouse
@@ -76,8 +123,13 @@ void ui_init(void) {
 }
 
 void ui_shutdown(void) {
+    if (ui_log_only) {
+        plain_log("INFO", "scanner stopped");
+        return;
+    }
     int w, h;
     get_term_size(&w, &h);
+    (void)w; (void)h;
     printf("%s", CSI "?1049l");  // Exit alt screen
     printf("%s", CSI "r");       // Reset scroll region
     printf("%s", SHOW_CURSOR);
@@ -87,6 +139,10 @@ void ui_shutdown(void) {
 }
 
 void ui_print_banner(void) {
+    if (ui_log_only) {
+        plain_log("INFO", "TaxenHeimer C Scanner v1.0");
+        return;
+    }
     printf(COLOR_BLUE);
     printf("╔════════════════════════════════════════╗\n");
     printf("║      TaxenHeimer C Scanner v1.0        ║\n");
@@ -96,6 +152,11 @@ void ui_print_banner(void) {
 }
 
 void ui_print_config(int threads, int subnets, int port, int timeout_ms) {
+    if (ui_log_only) {
+        plain_log("INFO", "config: threads=%d subnets=%d port=%d timeout=%dms",
+                  threads, subnets, port, timeout_ms);
+        return;
+    }
     printf("Configuration:\n");
     printf("  " COLOR_GRAY "Threads:" COLOR_RESET "  %d\n", threads);
     printf("  " COLOR_GRAY "Subnets:" COLOR_RESET "  %d\n", subnets);
@@ -105,34 +166,56 @@ void ui_print_config(int threads, int subnets, int port, int timeout_ms) {
 }
 
 void ui_print_server(const server_info_t *info) {
+    if (ui_log_only) {
+        // One line per hit. MOTD + sample names are already sanitized in
+        // parse_server_json (no ESC/CSI bytes), so it's safe to log verbatim.
+        plain_log("HIT", "%s:%d version=\"%s\" protocol=%d players=%d/%d motd=\"%s\"",
+                  info->ip, info->port,
+                  info->version[0] ? info->version : "?",
+                  info->protocol,
+                  info->players.online, info->players.max,
+                  info->motd);
+        if (info->players.sample_count > 0) {
+            char buf[512];
+            size_t off = 0;
+            for (int i = 0; i < info->players.sample_count && off < sizeof(buf) - 1; i++) {
+                off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+                                        "%s%s", i ? "," : "",
+                                        info->players.sample[i].name);
+            }
+            plain_log("HIT", "%s:%d sample=[%s]", info->ip, info->port, buf);
+        }
+        return;
+    }
+
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
     char time_str[16];
     strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
-    
+
     pthread_mutex_lock(&ui_lock);
     ui_printing = 1;
-    
+
     // Move to end of scroll region and add newline to scroll
     printf(CSI "999;1H");  // Move to bottom-right
     printf("\n");
-    
+
     // Print server info
     printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_BLUE "INFO" COLOR_RESET "] ", time_str);
     printf(COLOR_BLUE "ONLINE" COLOR_RESET " %s:%d | ", info->ip, info->port);
     printf("Version: " COLOR_YELLOW "%s" COLOR_RESET " | ", info->version[0] ? info->version : "?");
     printf("Protocol: %d\n", info->protocol);
-    
+
     // Print MOTD
     if (info->motd[0]) {
         printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_BLUE "INFO" COLOR_RESET "] ", time_str);
         printf("MOTD: " COLOR_YELLOW "%s" COLOR_RESET "\n", info->motd);
     }
-    
+
     // Print player info
     printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_BLUE "INFO" COLOR_RESET "] ", time_str);
     printf("Players: " COLOR_GREEN "%d/%d" COLOR_RESET, info->players.online, info->players.max);
-    
+
     // Print player sample if available
     if (info->players.sample_count > 0) {
         printf(" | Sample: ");
@@ -142,7 +225,7 @@ void ui_print_server(const server_info_t *info) {
         }
     }
     printf("\n");
-    
+
     fflush(stdout);
     ui_printing = 0;
     pthread_mutex_unlock(&ui_lock);
@@ -163,6 +246,23 @@ void ui_print_stats(void) {
 }
 
 void ui_render_header(int current_subnet, int total_subnets, int host_offset, int host_total) {
+    // Log-only mode emits a compact periodic stats line instead of the TUI
+    // header. Called from main.c on every tick; rate-limited here so the
+    // log stays readable.
+    if (ui_log_only) {
+        static time_t last_log = 0;
+        time_t now = time(NULL);
+        if (now - last_log < 30) return;
+        last_log = now;
+        uint64_t scanned, found, errors;
+        stats_get(&scanned, &found, &errors);
+        double rate = stats_get_rate();
+        plain_log("STAT",
+                  "engine=%s scanned=%lu found=%lu errors=%lu rate=%.1f/s subnet=%d/%d",
+                  ui_engine, scanned, found, errors, rate,
+                  current_subnet, total_subnets);
+        return;
+    }
     // Skip header update if a log is being printed
     if (ui_printing) return;
 
@@ -307,11 +407,17 @@ void ui_render_header(int current_subnet, int total_subnets, int host_offset, in
 }
 
 void ui_print_summary(uint64_t scanned, uint64_t found, uint64_t errors) {
+    if (ui_log_only) {
+        double sr = scanned > 0 ? (double)found * 100.0 / (double)scanned : 0.0;
+        plain_log("INFO", "scan complete scanned=%lu found=%lu errors=%lu success=%.2f%%",
+                  scanned, found, errors, sr);
+        return;
+    }
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
     char time_str[16];
     strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
-    
+
     printf("\n\n");
     printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_BLUE "INFO" COLOR_RESET "] ", time_str);
     printf(COLOR_BLUE);
@@ -335,6 +441,10 @@ void ui_print_summary(uint64_t scanned, uint64_t found, uint64_t errors) {
 }
 
 void ui_log(const char *level, const char *message) {
+    if (ui_log_only) {
+        plain_log(level, "%s", message);
+        return;
+    }
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
     char time_str[16];
@@ -359,18 +469,22 @@ void ui_log(const char *level, const char *message) {
 }
 
 void ui_print_shutdown_message(const char *message) {
+    if (ui_log_only) {
+        plain_log("WARN", "%s", message);
+        return;
+    }
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
     char time_str[16];
     strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
-    
+
     pthread_mutex_lock(&ui_lock);
     ui_printing = 1;
-    
+
     // Move to end of scroll region and add newline to scroll
     printf(CSI "999;1H");  // Move to bottom-right
     printf("\n");
-    
+
     printf(COLOR_DARK "[%s]" COLOR_RESET " [" COLOR_YELLOW "WARN" COLOR_RESET "] %s\n", time_str, message);
     fflush(stdout);
     ui_printing = 0;

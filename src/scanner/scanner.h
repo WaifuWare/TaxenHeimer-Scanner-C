@@ -28,6 +28,7 @@ typedef struct {
 typedef struct {
     bool success;
     char ip[16];
+    uint32_t ip_u32;   // host-order IP, pre-parsed to skip sscanf in dedup/stats.
     int port;
     char version[128];
     char motd[512];
@@ -49,6 +50,9 @@ void scanner_cleanup_pool(void);
 
 // Shared parsers (used by both epoll scanner and rawnet)
 int parse_server_json(const char *json_buf, server_info_t *info);
+// Length-aware variant — avoids forcing callers to allocate a NUL-terminated
+// copy of the SLP JSON body.
+int parse_server_json_n(const char *json_buf, size_t json_len, server_info_t *info);
 int parse_varint_buf(const uint8_t *buf, size_t len, int32_t *out, int *consumed);
 
 // Wire an interrupt flag so async scan loops can abort promptly on shutdown.

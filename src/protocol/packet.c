@@ -22,24 +22,26 @@ int write_varint(packet_t *pkt, int32_t value) {
     return -1;
 }
 
-// Read VarInt from socket
+// Read VarInt from socket. Uses an unsigned accumulator to avoid signed-shift
+// UB on the fifth byte (shift amount 28 overflows int). Cast to int32_t at
+// the end and let the caller reject negative values.
 int read_varint(int sockfd, int32_t *value) {
     int num_read = 0;
-    int result = 0;
+    uint32_t result = 0;
     uint8_t byte;
-    
+
     while (1) {
         ssize_t n = recv(sockfd, &byte, 1, 0);
         if (n <= 0) return -1;
-        
-        result |= (byte & 0x7F) << (7 * num_read);
+
+        result |= (uint32_t)(byte & 0x7F) << (7 * num_read);
         num_read++;
-        
+
         if (num_read > 5) return -1;
         if ((byte & 0x80) == 0) break;
     }
-    
-    *value = result;
+
+    *value = (int32_t)result;
     return 0;
 }
 
