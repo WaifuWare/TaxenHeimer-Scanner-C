@@ -14,8 +14,8 @@
  */
 
 #define _GNU_SOURCE
-#include "rawnet/rawscan.h"
-#include "rawnet/tcpkt.h"
+#include "engines/rawscan.h"
+#include "engines/tcpkt.h"
 #include "scanner/subnet_stats.h"
 #include "protocol/packet.h"
 #include "core/settings.h"
@@ -163,26 +163,7 @@ static int build_mc_payload(uint8_t *buf, size_t cap, const char *ip, int port) 
 
 static int try_parse_slp(conn_t *c, server_info_t *info) {
     if (c->rx_len <= 0) return 0;
-    int32_t pkt_len; int consumed;
-    int r = parse_varint_buf(c->rx_buf, (size_t)c->rx_len, &pkt_len, &consumed);
-    if (r <= 0) return r;
-    if (pkt_len <= 0 || pkt_len > CONN_RX_CAP) return -1;
-    size_t header = (size_t)consumed;
-    if ((size_t)c->rx_len < header + (size_t)pkt_len) return 0;
-    size_t pos = header, body_end = header + (size_t)pkt_len;
-    int32_t pkt_id;
-    r = parse_varint_buf(c->rx_buf + pos, body_end - pos, &pkt_id, &consumed);
-    if (r <= 0) return r < 0 ? -1 : 0;
-    pos += (size_t)consumed;
-    if (pkt_id != 0x00) return -1;
-    int32_t json_len;
-    r = parse_varint_buf(c->rx_buf + pos, body_end - pos, &json_len, &consumed);
-    if (r <= 0) return r < 0 ? -1 : 0;
-    pos += (size_t)consumed;
-    if (json_len <= 0 || (size_t)json_len > body_end - pos) return -1;
-    // parse directly in-place — no per-packet malloc
-    int ok = parse_server_json_n((const char *)(c->rx_buf + pos), (size_t)json_len, info);
-    return ok ? 1 : -1;
+    return parse_slp_frame(c->rx_buf, (size_t)c->rx_len, CONN_RX_CAP, info);
 }
 
 // ─── Raw send ────────────────────────────────────────────────────────────────

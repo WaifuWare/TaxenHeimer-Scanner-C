@@ -13,7 +13,7 @@
  */
 
 #define _GNU_SOURCE
-#include "scanner/portscan.h"
+#include "engines/portscan.h"
 #include "scanner/hitqueue.h"
 #include "core/settings.h"
 

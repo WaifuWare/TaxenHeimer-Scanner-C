@@ -24,7 +24,9 @@ typedef struct {
     int sample_count;
 } players_t;
 
-// Server information structure
+// Server information structure. Default shape is the Java SLP payload. The
+// bedrock fields are only populated by the RakNet engine (src/engines/
+// bedrock.c); when bedrock=false the backend ignores them.
 typedef struct {
     bool success;
     char ip[16];
@@ -34,6 +36,14 @@ typedef struct {
     char motd[512];
     int protocol;
     players_t players;
+
+    // Bedrock / RakNet-only fields. Zero-initialised for Java hits.
+    bool bedrock;
+    char motd2[256];        // MCPE second MOTD line
+    char gamemode[32];      // "Survival", "Creative", "Adventure", etc
+    int  port_v4;           // server's canonical IPv4 port (often != scan port)
+    int  port_v6;           // IPv6 port
+    uint64_t server_guid;   // RakNet server GUID
 } server_info_t;
 
 // Scanner functions
@@ -54,6 +64,16 @@ int parse_server_json(const char *json_buf, server_info_t *info);
 // copy of the SLP JSON body.
 int parse_server_json_n(const char *json_buf, size_t json_len, server_info_t *info);
 int parse_varint_buf(const uint8_t *buf, size_t len, int32_t *out, int *consumed);
+
+// parse_slp_frame consumes a complete Minecraft Server List Ping response
+// from buf[0..len]: VarInt pkt_len, VarInt pkt_id (must be 0), VarInt
+// json_len, then the JSON status body. On success info is populated from
+// the JSON and the function returns 1. Returns 0 when more bytes are
+// needed (partial frame) and -1 on malformed input or pkt_len that
+// exceeds max_body_len. max_body_len is the caller's response cap (e.g.
+// SLOT_RESP_CAP / CONN_RX_CAP) — anything larger is treated as a framing
+// error so a bad peer can't force a 32-bit-wide allocation attempt.
+int parse_slp_frame(const uint8_t *buf, size_t len, size_t max_body_len, server_info_t *info);
 
 // Wire an interrupt flag so async scan loops can abort promptly on shutdown.
 #include <signal.h>

@@ -9,8 +9,8 @@
  */
 
 #define _GNU_SOURCE
-#include "rawnet/synblast.h"
-#include "rawnet/tcpkt.h"
+#include "engines/synblast.h"
+#include "engines/tcpkt.h"
 #include "scanner/hitqueue.h"
 #include "core/settings.h"
 #include "core/log.h"

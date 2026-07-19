@@ -25,6 +25,10 @@
             clang
             curl
             readline70
+            libbpf
+            libxdp
+            elfutils
+            zlib
           ];
         in
         {
@@ -45,6 +49,11 @@
               pkg-config
               gdb
               valgrind
+              libbpf
+              libxdp
+              bpftools
+              iproute2
+              libcap
             ];
             nativeBuildInputs = packages;
             buildInputs = libs;

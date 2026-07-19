@@ -191,15 +191,87 @@ rawmode_off() {
     fi
 }
 
+# ── XDP mode setup ─────────────────────────────────────────────────────────
+# Prep the host for `-X` (AF_XDP) runs: mount bpffs, detach any stale XDP
+# program left behind by a prior crashed run, and stamp CAP_NET_RAW +
+# CAP_NET_ADMIN + CAP_BPF + CAP_PERFMON onto the scanner binary. CAP_PERFMON
+# is needed since kernel 5.8 — without it the BPF verifier runs in
+# restricted mode and rejects libxdp's dispatcher (pointer-compare op).
+# Caps are stripped on every `make`, so rerun xdp-setup after each build.
+
+BPFFS_DIR="/sys/fs/bpf"
+SCANNER_BIN="${SCANNER_BIN:-build/scanner}"
+
+xdp_setup() {
+    need_root
+    local iface="${1:-}"
+    if [[ -z "$iface" ]]; then
+        echo "usage: $0 xdp-setup <iface>" >&2
+        exit 1
+    fi
+    if ! ip link show dev "$iface" >/dev/null 2>&1; then
+        echo "error: interface '$iface' not found" >&2
+        exit 1
+    fi
+
+    echo "Mounting bpffs at $BPFFS_DIR..."
+    if mount | grep -q "on $BPFFS_DIR type bpf"; then
+        echo "  already mounted"
+    else
+        mkdir -p "$BPFFS_DIR"
+        mount -t bpf bpf "$BPFFS_DIR"
+        echo "  ok"
+    fi
+    # Default mode on fresh mount is 0700 root:root, which blocks non-root
+    # scanner (running with file caps) from pinning the libxdp dispatcher.
+    # Sticky 1777 mirrors /tmp semantics — anyone can create, only owner
+    # can delete their own entries.
+    chmod 1777 "$BPFFS_DIR"
+    echo "  chmod 1777 $BPFFS_DIR"
+
+    echo "Detaching any stale XDP program on $iface..."
+    ip link set dev "$iface" xdpgeneric off 2>/dev/null || true
+    ip link set dev "$iface" xdpdrv off 2>/dev/null || true
+    ip link set dev "$iface" xdp off 2>/dev/null || true
+    echo "  ok"
+
+    echo "Applying scanner capabilities..."
+    if [[ ! -x "$SCANNER_BIN" ]]; then
+        echo "  warn: $SCANNER_BIN not found — build first (make), then rerun"
+    else
+        setcap cap_net_raw,cap_net_admin,cap_bpf,cap_perfmon+ep "$SCANNER_BIN"
+        echo "  ok   $(getcap "$SCANNER_BIN")"
+    fi
+
+    echo
+    echo "Ready. Run: $SCANNER_BIN -X -i $iface"
+}
+
+xdp_teardown() {
+    need_root
+    local iface="${1:-}"
+    if [[ -z "$iface" ]]; then
+        echo "usage: $0 xdp-teardown <iface>" >&2
+        exit 1
+    fi
+    echo "Detaching XDP on $iface..."
+    ip link set dev "$iface" xdpgeneric off 2>/dev/null || true
+    ip link set dev "$iface" xdpdrv off 2>/dev/null || true
+    ip link set dev "$iface" xdp off 2>/dev/null || true
+    echo "  ok"
+}
+
 case "${1:-}" in
-    apply)      apply_settings ;;
-    persist)    persist_settings ;;
-    show)       show_settings ;;
-    revert)     revert_settings ;;
-    rawmode-on) rawmode_on ;;
-    rawmode-off)rawmode_off ;;
+    apply)        apply_settings ;;
+    persist)      persist_settings ;;
+    show)         show_settings ;;
+    revert)       revert_settings ;;
+    rawmode-on)   rawmode_on ;;
+    rawmode-off)  rawmode_off ;;
+    xdp-setup)    shift; xdp_setup "${1:-}" ;;
+    xdp-teardown) shift; xdp_teardown "${1:-}" ;;
     *)
-        echo "usage: $0 {apply|persist|show|revert|rawmode-on|rawmode-off}"
+        echo "usage: $0 {apply|persist|show|revert|rawmode-on|rawmode-off|xdp-setup <iface>|xdp-teardown <iface>}"
         exit 1
         ;;
 esac

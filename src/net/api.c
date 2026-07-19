@@ -323,7 +323,22 @@ static int send_batch_ipc(const batch_t *batch) {
     jb_reserve(&jb, 32 + (size_t)batch->count * 512);
     if (jb.oom) return -1;
 
-    jb_literal(&jb, "{\"servers\":[");
+    // Edition derived from the first server — every engine only emits its
+    // own kind per batch, but we assert homogeneity below and scream to
+    // the log if the invariant breaks (should be impossible today since
+    // one engine is active per run).
+    bool batch_bedrock = batch->count > 0 && batch->servers[0].bedrock;
+    for (int i = 1; i < batch->count; i++) {
+        if (batch->servers[i].bedrock != batch_bedrock) {
+            log_error("IPC batch mixes java+bedrock — serialising as %s anyway",
+                      batch_bedrock ? "bedrock" : "java");
+            break;
+        }
+    }
+
+    jb_literal(&jb, "{\"edition\":");
+    jb_str(&jb, batch_bedrock ? "bedrock" : "java");
+    jb_literal(&jb, ",\"servers\":[");
     for (int i = 0; i < batch->count; i++) {
         const server_info_t *s = &batch->servers[i];
         char version[256], software[256];
@@ -334,6 +349,8 @@ static int send_batch_ipc(const batch_t *batch) {
         jb_str(&jb, s->ip);
         jb_literal(&jb, ",\"port\":");
         jb_int(&jb, s->port);
+        jb_literal(&jb, ",\"edition\":");
+        jb_str(&jb, s->bedrock ? "bedrock" : "java");
         jb_literal(&jb, ",\"motd\":");
         jb_str(&jb, s->motd[0] ? s->motd : "");
         jb_literal(&jb, ",\"version\":");
@@ -355,7 +372,20 @@ static int send_batch_ipc(const batch_t *batch) {
             jb_str(&jb, s->players.sample[j].id);
             jb_putc(&jb, '}');
         }
-        jb_literal(&jb, "]}");
+        jb_literal(&jb, "]");
+        if (s->bedrock) {
+            jb_literal(&jb, ",\"motd2\":");
+            jb_str(&jb, s->motd2);
+            jb_literal(&jb, ",\"gamemode\":");
+            jb_str(&jb, s->gamemode);
+            jb_literal(&jb, ",\"port_v4\":");
+            jb_int(&jb, s->port_v4);
+            jb_literal(&jb, ",\"port_v6\":");
+            jb_int(&jb, s->port_v6);
+            jb_literal(&jb, ",\"server_guid\":");
+            jb_int(&jb, (long)s->server_guid);
+        }
+        jb_putc(&jb, '}');
     }
     jb_literal(&jb, "]}");
 

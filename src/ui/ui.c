@@ -252,15 +252,46 @@ void ui_render_header(int current_subnet, int total_subnets, int host_offset, in
     if (ui_log_only) {
         static time_t last_log = 0;
         time_t now = time(NULL);
-        if (now - last_log < 30) return;
+        if (now - last_log < 10) return;
         last_log = now;
         uint64_t scanned, found, errors;
         stats_get(&scanned, &found, &errors);
-        double rate = stats_get_rate();
-        plain_log("STAT",
-                  "engine=%s scanned=%lu found=%lu errors=%lu rate=%.1f/s subnet=%d/%d",
-                  ui_engine, scanned, found, errors, rate,
-                  current_subnet, total_subnets);
+        uint64_t slp = stats_get_slp();
+        double rate = stats_get_instant_rate();
+        double slp_rate = stats_get_instant_slp_rate();
+        time_t uptime = now - ui_start_time;
+        double host_pct = host_total > 0
+                          ? (double)host_offset * 100.0 / (double)host_total
+                          : 0.0;
+        double overall_pct = total_subnets > 0
+                          ? ((double)current_subnet + host_pct / 100.0) * 100.0
+                            / (double)total_subnets
+                          : 0.0;
+        if (strcmp(ui_engine, "HYBRID") == 0) {
+            plain_log("STAT",
+                      "engine=%s uptime=%lds scanned=%lu slp=%lu found=%lu errors=%lu "
+                      "rate=%.1f/s slp_rate=%.1f/s subnet=%d/%d progress=%.2f%% "
+                      "probed=%lu open=%lu",
+                      ui_engine, (long)uptime, scanned, slp, found, errors,
+                      rate, slp_rate, current_subnet, total_subnets, overall_pct,
+                      ui_prescan_syns, ui_prescan_acks);
+        } else if (strcmp(ui_engine, "SYNBLAST") == 0 ||
+                   strcmp(ui_engine, "XDP") == 0) {
+            plain_log("STAT",
+                      "engine=%s uptime=%lds scanned=%lu slp=%lu found=%lu errors=%lu "
+                      "rate=%.1f/s slp_rate=%.1f/s subnet=%d/%d progress=%.2f%% "
+                      "syns=%lu fails=%lu rx=%lu acks=%lu",
+                      ui_engine, (long)uptime, scanned, slp, found, errors,
+                      rate, slp_rate, current_subnet, total_subnets, overall_pct,
+                      ui_prescan_syns, ui_prescan_fails,
+                      ui_prescan_rxpkts, ui_prescan_acks);
+        } else {
+            plain_log("STAT",
+                      "engine=%s uptime=%lds scanned=%lu slp=%lu found=%lu errors=%lu "
+                      "rate=%.1f/s subnet=%d/%d progress=%.2f%%",
+                      ui_engine, (long)uptime, scanned, slp, found, errors,
+                      rate, current_subnet, total_subnets, overall_pct);
+        }
         return;
     }
     // Skip header update if a log is being printed
@@ -271,41 +302,9 @@ void ui_render_header(int current_subnet, int total_subnets, int host_offset, in
 
     time_t elapsed = time(NULL) - ui_start_time;
 
-    // Instantaneous rate: scanned delta divided by wall-clock delta between
-    // refresh calls. Uses CLOCK_MONOTONIC so wall-clock jumps don't corrupt it.
-    // Exponentially smoothed with alpha=0.4 to cut single-tick jitter while
-    // still responding within ~2-3 refreshes to real rate changes.
-    static struct timespec last_ts = {0, 0};
-    static uint64_t last_scanned = 0;
-    static double smoothed_rate = 0.0;
-
-    struct timespec now_ts;
-    clock_gettime(CLOCK_MONOTONIC, &now_ts);
-
-    double rate = 0.0;
-    if (last_ts.tv_sec != 0 || last_ts.tv_nsec != 0) {
-        double dt = (double)(now_ts.tv_sec - last_ts.tv_sec)
-                  + (double)(now_ts.tv_nsec - last_ts.tv_nsec) / 1e9;
-        if (dt >= 0.05) {
-            uint64_t d_scanned = scanned >= last_scanned ? (scanned - last_scanned) : 0;
-            double instant = (double)d_scanned / dt;
-            if (smoothed_rate == 0.0) {
-                smoothed_rate = instant;
-            } else {
-                smoothed_rate = smoothed_rate * 0.6 + instant * 0.4;
-            }
-            rate = smoothed_rate;
-            last_ts = now_ts;
-            last_scanned = scanned;
-        } else {
-            // dt too small to trust — reuse previous smoothed value
-            rate = smoothed_rate;
-        }
-    } else {
-        // First sample — seed state, rate stays 0 for one tick
-        last_ts = now_ts;
-        last_scanned = scanned;
-    }
+    // EMA-smoothed instantaneous rate lives in stats.c so log-only and TUI
+    // paths share identical numbers regardless of which one polled last.
+    double rate = stats_get_instant_rate();
     
     char elapsed_str[32];
     if (elapsed < 60) {
@@ -323,7 +322,9 @@ void ui_render_header(int current_subnet, int total_subnets, int host_offset, in
     pthread_mutex_lock(&ui_lock);
     
     // Set scroll region below header. Prescan modes add 1 extra row.
-    int has_prescan = (strcmp(ui_engine, "HYBRID") == 0 || strcmp(ui_engine, "SYNBLAST") == 0);
+    int has_prescan = (strcmp(ui_engine, "HYBRID") == 0 ||
+                       strcmp(ui_engine, "SYNBLAST") == 0 ||
+                       strcmp(ui_engine, "XDP") == 0);
     int header_lines = has_prescan ? 9 : 8;
     printf(CSI "%d;%dr", header_lines, h);
     
@@ -337,6 +338,8 @@ void ui_render_header(int current_subnet, int total_subnets, int host_offset, in
     // Title with engine badge
     const char *badge_color = COLOR_GRAY;
     if (strcmp(ui_engine, "HYBRID") == 0) badge_color = COLOR_GREEN;
+    else if (strcmp(ui_engine, "XDP") == 0) badge_color = COLOR_GREEN;
+    else if (strcmp(ui_engine, "SYNBLAST") == 0) badge_color = COLOR_YELLOW;
     else if (strcmp(ui_engine, "RAW") == 0) badge_color = COLOR_YELLOW;
     printf(COLOR_BLUE "  TaxenHeimer" COLOR_RESET "  " COLOR_GRAY "Minecraft Scanner  v1.0" COLOR_RESET
            "  [%s%s" COLOR_RESET "]\n", badge_color, ui_engine);
@@ -364,7 +367,8 @@ void ui_render_header(int current_subnet, int total_subnets, int host_offset, in
                COLOR_GRAY "Hit%%" COLOR_RESET " " COLOR_YELLOW "%7.4f%%" COLOR_RESET "\n",
                ui_prescan_syns, ui_prescan_acks,
                ui_prescan_syns > 0 ? (double)ui_prescan_acks * 100.0 / (double)ui_prescan_syns : 0.0);
-    } else if (strcmp(ui_engine, "SYNBLAST") == 0) {
+    } else if (strcmp(ui_engine, "SYNBLAST") == 0 ||
+               strcmp(ui_engine, "XDP") == 0) {
         printf("  " COLOR_GRAY "SYNs" COLOR_RESET " " COLOR_BLUE "%8lu" COLOR_RESET
                "  " COLOR_GRAY "TX-err" COLOR_RESET " " COLOR_RED "%lu" COLOR_RESET
                "  " COLOR_GRAY "RX-pkts" COLOR_RESET " " COLOR_YELLOW "%lu" COLOR_RESET

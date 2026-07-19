@@ -22,15 +22,21 @@
 #include "scanner/subnet_stats.h"
 #include "scanner/dedup.h"
 #include "scanner/priority.h"
-#include "rawnet/rawscan.h"
-#include "rawnet/synblast.h"
+#include "engines/rawscan.h"
+#include "engines/synblast.h"
 #include "scanner/hitqueue.h"
-#include "scanner/portscan.h"
+#include "engines/portscan.h"
+#include "engines/iouring.h"
+#include "engines/bedrock.h"
+#ifdef HAVE_XDP
+#include "engines/xdp.h"
+#endif
 #include "net/api.h"
 #include "core/settings.h"
 #include "ui/ui.h"
 #include "core/config.h"
 #include "core/log.h"
+#include "core/cli.h"
 
 // Global state
 static volatile sig_atomic_t interrupted = 0;
@@ -42,6 +48,9 @@ static volatile int pass_completed = 0;     // Set by worker when full pass wrap
 static int use_rawscan = 0;                 // 1 = raw socket mode active
 static int use_hybrid = 0;                  // 1 = prescan + kernel TCP SLP workers
 static int use_synblast = 0;               // 1 = raw SYN prescan, 0 = kernel connect prescan
+static int use_iouring = 0;                 // 1 = io_uring SLP scanner
+static int use_bedrock = 0;                 // 1 = Bedrock UDP scanner (port 19132)
+static int use_xdp = 0;                     // 1 = XDP prescan + kernel TCP SLP workers
 static config_t g_config;
 static hit_queue_t g_hit_queue;             // prescan → worker queue (hybrid mode)
 
@@ -62,11 +71,13 @@ static void on_server_found(const server_info_t *info) {
     if (!info->success) {
         stats_increment_errors();
         stats_increment_scanned();
+        stats_increment_slp();
         return;
     }
 
     stats_increment_found();
     stats_increment_scanned();
+    stats_increment_slp();
 
     // Dedup: skip reporting unchanged servers
     uint32_t changed_fields = 0;
@@ -138,6 +149,11 @@ static void *prescan_thread(void *arg) {
             stats_add_scanned((uint64_t)ip_count);
 
             // Prescan: detect open ports and push to worker queue
+#ifdef HAVE_XDP
+            if (use_xdp)
+                xdp_prescan(ips, ip_count, &g_hit_queue);
+            else
+#endif
             if (use_synblast)
                 synblast_prescan(ips, ip_count, &g_hit_queue);
             else
@@ -162,10 +178,12 @@ static void on_hybrid_server_found(const server_info_t *info) {
 
     if (!info->success) {
         stats_increment_errors();
+        stats_increment_slp();
         return;
     }
 
     stats_increment_found();
+    stats_increment_slp();
 
     uint32_t changed_fields = 0;
     dedup_result_t dr = dedup_check(info, &changed_fields);
@@ -274,6 +292,10 @@ static void *scanner_thread(void *arg) {
         // Scan collected IPs concurrently
         if (use_rawscan)
             rawscan_batch(ips, ip_count, on_server_found);
+        else if (use_bedrock)
+            bedrock_scan_batch(ips, ip_count, on_server_found);
+        else if (use_iouring)
+            iouring_scan_batch(ips, ip_count, on_server_found);
         else
             scan_batch_async(ips, ip_count, on_server_found);
     }
@@ -282,39 +304,30 @@ static void *scanner_thread(void *arg) {
 }
 
 int main(int argc, char **argv) {
-    // Parse CLI. Scan mode is runtime-only now: pass -f each run for full
-    // IPv4; absence selects the known-ranges list. There is no persisted
-    // "current mode" — each mode keeps its own resume cursor in config.json.
-    bool cli_full = false;
-    bool cli_raw = false;
-    bool cli_hybrid = false;
-    bool cli_synblast = false;
-    bool cli_log_only = false;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--full") == 0 || strcmp(argv[i], "-f") == 0) {
-            cli_full = true;
-        } else if (strcmp(argv[i], "--raw") == 0 || strcmp(argv[i], "-r") == 0) {
-            cli_raw = true;
-        } else if (strcmp(argv[i], "--hybrid") == 0 || strcmp(argv[i], "-H") == 0) {
-            cli_hybrid = true;
-        } else if (strcmp(argv[i], "--synblast") == 0 || strcmp(argv[i], "-S") == 0) {
-            cli_synblast = true;
-        } else if (strcmp(argv[i], "--log-only") == 0 || strcmp(argv[i], "-l") == 0) {
-            cli_log_only = true;
-        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: %s [options]\n", argv[0]);
-            printf("Options:\n");
-            printf("  -f, --full       Scan the entire routable IPv4 space (default: known /16s)\n");
-            printf("  -r, --raw        Use raw sockets (bypass kernel TCP, needs CAP_NET_RAW)\n");
-            printf("  -H, --hybrid     Fast connect prescan + kernel TCP SLP (works behind NAT)\n");
-            printf("  -S, --synblast   Raw SYN prescan + kernel TCP SLP (needs public IP + CAP_NET_RAW)\n");
-            printf("  -l, --log-only   Disable TUI; emit plain timestamped log lines (auto when stdout is not a TTY)\n");
-            printf("  -h, --help       Show this help\n");
-            return 0;
-        }
+    // Scan mode is runtime-only: pass -f each run for full IPv4; absence
+    // selects the known-ranges list. There is no persisted "current mode"
+    // — each mode keeps its own resume cursor in config.json.
+    cli_opts_t cli;
+    switch (cli_parse(argc, argv, &cli)) {
+        case CLI_EXIT_OK:   return 0;
+        case CLI_EXIT_FAIL: return 1;
+        case CLI_OK:        break;
     }
+    bool cli_full      = cli.full;
+    bool cli_raw       = cli.raw;
+    bool cli_hybrid    = cli.hybrid;
+    bool cli_synblast  = cli.synblast;
+    bool cli_iouring   = cli.iouring;
+    bool cli_bedrock   = cli.bedrock;
+    bool cli_xdp       = cli.xdp;
+    const char *cli_ifname = cli.ifname;
+    int  cli_queue_id  = cli.queue_id;
 
-    if (cli_log_only) ui_set_log_only(1);
+    // Force plain logging during init. If any mode init fails we exit
+    // without ever entering the TUI alt-screen, so error messages stay
+    // visible in the user's scrollback. TUI is turned on after all init
+    // succeeds.
+    ui_set_log_only(1);
 
     // Raise file descriptor limit — hybrid/synblast modes need many concurrent FDs
     struct rlimit rl;
@@ -347,19 +360,18 @@ int main(int argc, char **argv) {
     // Initialize socket pool
     scanner_init_pool();
 
-    // Initialize UI first so log messages appear in TUI scroll region
-    ui_init();
-
     // Try raw socket mode if requested
     if (cli_raw && !cli_hybrid) {
-        rawscan_set_interrupt(&interrupted);
-        if (rawscan_init() == 0) {
-            use_rawscan = 1;
-            log_info("Raw socket scanner active — bypass kernel TCP");
-        } else {
-            log_error("Raw socket init failed — need CAP_NET_RAW: sudo setcap cap_net_raw+ep ./scanner");
-            log_warn("Falling back to EPOLL mode");
+        if (check_public_local_ip("RAW") < 0) {
+            return 1;
         }
+        rawscan_set_interrupt(&interrupted);
+        if (rawscan_init() != 0) {
+            log_error("Raw socket init failed — need CAP_NET_RAW: sudo setcap cap_net_raw+ep ./scanner");
+            return 1;
+        }
+        use_rawscan = 1;
+        log_info("Raw socket scanner active — bypass kernel TCP");
     }
 
     // Hybrid mode: kernel connect prescan (works behind NAT, no special caps)
@@ -372,24 +384,76 @@ int main(int argc, char **argv) {
         log_info("Hybrid mode active — connect prescan + kernel TCP SLP");
     }
 
-    // Synblast mode: raw SYN prescan (needs public IP + CAP_NET_RAW)
-    if (cli_synblast) {
-        synblast_set_interrupt(&interrupted);
-        if (synblast_init() == 0) {
-            use_hybrid = 1;
-            use_synblast = 1;
-            hitqueue_init(&g_hit_queue);
-            log_info("Synblast mode active — raw SYN prescan + kernel TCP SLP");
-        } else {
-            log_error("Synblast init failed — need CAP_NET_RAW: sudo setcap cap_net_raw+ep ./scanner");
-            log_warn("Falling back to EPOLL mode");
+    // io_uring mode: async SLP scan, kernel 5.6+, works behind NAT
+    if (cli_iouring && !cli_raw && !cli_hybrid && !cli_synblast && !cli_bedrock) {
+        iouring_set_interrupt(&interrupted);
+        if (iouring_init() != 0) {
+            log_error("io_uring init failed — kernel 5.6+ required");
+            return 1;
         }
+        use_iouring = 1;
+        log_info("io_uring mode active — async SLP via kernel ring");
     }
 
+    // Bedrock mode: UDP Unconnected Ping on port 19132
+    if (cli_bedrock && !cli_raw && !cli_hybrid && !cli_synblast && !cli_iouring) {
+        bedrock_set_interrupt(&interrupted);
+        use_bedrock = 1;
+        log_info("Bedrock mode active — UDP ping on port %d", BEDROCK_PORT);
+    }
+
+    // XDP mode: eBPF SYN-ACK filter redirects replies into AF_XDP ring
+#ifdef HAVE_XDP
+    if (cli_xdp) {
+        if (check_public_local_ip("XDP") < 0) {
+            return 1;
+        }
+        xdp_set_interrupt(&interrupted);
+        if (xdp_init(cli_ifname, cli_queue_id) != 0) {
+            log_error("XDP init failed (need -i <iface>, libbpf/libxdp, CAP_NET_ADMIN + CAP_BPF + CAP_PERFMON)");
+            return 1;
+        }
+        use_hybrid  = 1;
+        use_xdp     = 1;
+        use_synblast = 0;
+        hitqueue_init(&g_hit_queue);
+        log_info("XDP mode active — eBPF prescan + kernel TCP SLP");
+    }
+#else
+    if (cli_xdp) {
+        log_error("XDP mode not compiled in — rebuild with libbpf-devel + libxdp-devel + clang");
+        return 1;
+    }
+#endif
+
+    // Synblast mode: raw SYN prescan (needs public IP + CAP_NET_RAW)
+    if (cli_synblast) {
+        if (check_public_local_ip("SYNBLAST") < 0) {
+            return 1;
+        }
+        synblast_set_interrupt(&interrupted);
+        if (synblast_init() != 0) {
+            log_error("Synblast init failed — need CAP_NET_RAW: sudo setcap cap_net_raw+ep ./scanner");
+            return 1;
+        }
+        use_hybrid = 1;
+        use_synblast = 1;
+        hitqueue_init(&g_hit_queue);
+        log_info("Synblast mode active — raw SYN prescan + kernel TCP SLP");
+    }
+
+    // All requested modes initialized successfully — safe to enter TUI. If
+    // the user passed -l we stay in log-only; otherwise flip to alt-screen.
+    if (!cli.log_only) ui_set_log_only(0);
+    ui_init();
+
     // Set engine label for TUI header
-    if (use_hybrid && use_synblast) ui_set_engine("SYNBLAST");
+    if (use_hybrid && use_xdp) ui_set_engine("XDP");
+    else if (use_hybrid && use_synblast) ui_set_engine("SYNBLAST");
     else if (use_hybrid) ui_set_engine("HYBRID");
     else if (use_rawscan) ui_set_engine("RAW");
+    else if (use_bedrock) ui_set_engine("BEDROCK");
+    else if (use_iouring) ui_set_engine("IOURING");
     else ui_set_engine("EPOLL");
 
     // Initialize API client
@@ -401,8 +465,12 @@ int main(int argc, char **argv) {
     // Initialize subnet adaptive timeout stats
     subnet_stats_init();
 
-    // Initialize dedup table (~64 MB)
-    dedup_init();
+    // Initialize dedup table. Bedrock-only runs use a 4 MiB table — the
+    // public bedrock-server universe is small enough that 256 Ki slots
+    // fit with room to spare, so we don't need the 64 MiB default that
+    // full IPv4 Java scanning wants.
+    uint32_t dedup_bits = use_bedrock ? 18 : 22;
+    dedup_init(dedup_bits);
 
     // Build mutable subnet array based on mode (mutable for priority reorder).
     int subnet_count = 0;
@@ -503,6 +571,13 @@ int main(int argc, char **argv) {
     
     // Stats display loop - also save config periodically
     int save_counter = 0;
+    int trim_counter = 0;
+    // Dedup trim cadence: 5 minutes. Scans the whole 64 MiB table and
+    // MADV_DONTNEEDs every page that's still all-zero, so RSS tracks the
+    // working set instead of the peak touched-set. Cost per tick is a
+    // sequential memory walk (~tens of ms) and per-shard lock churn,
+    // both negligible at this cadence.
+    const int trim_interval_ticks = 5 * 60 * 2;  // 5 min at 500 ms per tick
     while (!interrupted) {
         usleep(500 * 1000);  // 500 ms refresh
 
@@ -517,7 +592,19 @@ int main(int argc, char **argv) {
             subnet_stats_reset();
         }
 
-        // Feed prescan stats to UI (hybrid/synblast mode)
+        if (++trim_counter >= trim_interval_ticks) {
+            trim_counter = 0;
+            dedup_trim();
+        }
+
+        // Feed prescan stats to UI (hybrid/synblast/xdp mode)
+#ifdef HAVE_XDP
+        if (use_hybrid && use_xdp) {
+            uint64_t syns, fails, rxpkts, acks;
+            xdp_get_stats(&syns, &fails, &rxpkts, &acks);
+            ui_set_prescan_stats(syns, fails, rxpkts, acks);
+        } else
+#endif
         if (use_hybrid && use_synblast) {
             uint64_t syns, fails, rxpkts, acks;
             synblast_get_stats(&syns, &fails, &rxpkts, &acks);
@@ -598,6 +685,10 @@ int main(int argc, char **argv) {
     scanner_cleanup_pool();
 
     if (use_rawscan) rawscan_shutdown();
+    if (use_iouring) iouring_shutdown();
+#ifdef HAVE_XDP
+    if (use_xdp) xdp_shutdown();
+#endif
     if (use_hybrid) {
         if (use_synblast) synblast_shutdown();
         hitqueue_destroy(&g_hit_queue);

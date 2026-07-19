@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 // FNV-1a 32-bit hash
 static uint32_t fnv1a(const void *data, size_t len) {
@@ -22,22 +24,24 @@ static uint32_t hash_str(const char *s) {
 // Open-addressed hash table keyed by IP (uint32_t).
 // Value: per-field hashes for change detection.
 //
-// Sharding: 256 shards of ~16K entries each, each guarded by its own mutex.
-// A single global mutex serialises all 8 worker threads on every lookup —
-// with 20K+ hits/sec, the cache-line bounce on the mutex + cond var alone
-// dominates a large fraction of the dedup cost. Sharding spreads contention
-// across 256 cache lines so simultaneous lookups on different /24 addresses
-// don't stall each other. Total memory usage and total bucket count are
-// unchanged.
-#define DEDUP_TABLE_BITS   22
-#define DEDUP_TABLE_SIZE   (1u << DEDUP_TABLE_BITS)
-#define DEDUP_TABLE_MASK   (DEDUP_TABLE_SIZE - 1u)
-
+// Sharding: 256 shards, each guarded by its own mutex. A single global
+// mutex serialised all workers on every lookup — with 20K+ hits/sec,
+// the cache-line bounce on the mutex alone dominated cost. Sharding
+// spreads contention across 256 cache lines so simultaneous lookups on
+// different /24 addresses don't stall each other.
+//
+// The table size is chosen at init time so bedrock-only runs (small
+// public-server universe) can allocate a ~4 MiB table instead of the
+// ~64 MiB default — see dedup_init. Shard count stays at 256
+// regardless; only the per-shard slot count shrinks.
 #define DEDUP_SHARD_BITS   8
 #define DEDUP_SHARD_COUNT  (1u << DEDUP_SHARD_BITS)
 #define DEDUP_SHARD_MASK   (DEDUP_SHARD_COUNT - 1u)
-#define DEDUP_SHARD_SIZE   (DEDUP_TABLE_SIZE / DEDUP_SHARD_COUNT)
-#define DEDUP_SHARD_MASKL  (DEDUP_SHARD_SIZE - 1u)
+
+static uint32_t table_bits  = 22;
+static uint32_t table_size  = 0;   // 1u << table_bits
+static uint32_t shard_size  = 0;   // table_size / DEDUP_SHARD_COUNT
+static uint32_t shard_maskl = 0;   // shard_size - 1
 
 typedef struct {
     uint32_t ip;            // 0 = empty
@@ -57,12 +61,33 @@ typedef struct {
 static dedup_entry_t *table = NULL;
 static padded_mutex_t shard_locks[DEDUP_SHARD_COUNT];
 
-void dedup_init(void) {
-    if (!table) {
-        table = (dedup_entry_t *)calloc(DEDUP_TABLE_SIZE, sizeof(dedup_entry_t));
-        for (uint32_t i = 0; i < DEDUP_SHARD_COUNT; i++) {
-            pthread_mutex_init(&shard_locks[i].lock, NULL);
-        }
+void dedup_init(uint32_t bits) {
+    if (table) return;  // idempotent — first caller wins
+
+    // Clamp to a sane range. Lower bound preserves probe-room headroom
+    // (shard_size must be > 32 so the linear-probe cap isn't the entire
+    // shard); upper bound stays at 24 so we don't blow past 256 MiB by
+    // accident.
+    if (bits < 12) bits = 12;
+    if (bits > 24) bits = 24;
+    table_bits  = bits;
+    table_size  = 1u << table_bits;
+    shard_size  = table_size / DEDUP_SHARD_COUNT;
+    shard_maskl = shard_size - 1u;
+
+    // aligned_alloc (not calloc) so the table starts on a page
+    // boundary — dedup_trim's MADV_DONTNEED requires page-aligned
+    // addresses.
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t page = ps > 0 ? (size_t)ps : 4096;
+    size_t bytes = (size_t)table_size * sizeof(dedup_entry_t);
+    size_t rounded = (bytes + page - 1) & ~(page - 1);
+    table = (dedup_entry_t *)aligned_alloc(page, rounded);
+    if (table) {
+        memset(table, 0, rounded);
+    }
+    for (uint32_t i = 0; i < DEDUP_SHARD_COUNT; i++) {
+        pthread_mutex_init(&shard_locks[i].lock, NULL);
     }
 }
 
@@ -71,10 +96,58 @@ void dedup_reset(void) {
         for (uint32_t i = 0; i < DEDUP_SHARD_COUNT; i++) {
             pthread_mutex_lock(&shard_locks[i].lock);
         }
-        memset(table, 0, DEDUP_TABLE_SIZE * sizeof(dedup_entry_t));
+        memset(table, 0, (size_t)table_size * sizeof(dedup_entry_t));
+        // Drop the physical backing too — after reset there's no reason
+        // to keep the old touched-page set in RSS. Next insert will
+        // fault the relevant page back in on demand.
+        long ps = sysconf(_SC_PAGESIZE);
+        size_t page = ps > 0 ? (size_t)ps : 4096;
+        size_t bytes = (size_t)table_size * sizeof(dedup_entry_t);
+        size_t rounded = (bytes + page - 1) & ~(page - 1);
+        madvise(table, rounded, MADV_DONTNEED);
         for (uint32_t i = 0; i < DEDUP_SHARD_COUNT; i++) {
             pthread_mutex_unlock(&shard_locks[i].lock);
         }
+    }
+}
+
+void dedup_trim(void) {
+    if (!table) return;
+
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t page = ps > 0 ? (size_t)ps : 4096;
+    size_t entries_per_page = page / sizeof(dedup_entry_t);
+    if (entries_per_page == 0) return;
+
+    // Iterate shard-by-shard so we only ever block inserts on one /256th
+    // of the table at a time. Each shard is 16K entries = 64 pages at
+    // 4K, so the critical section is small and bounded.
+    // Guard against shrunk tables where a whole page no longer fits in
+    // a shard — then per-page trim is pointless (the first touch of any
+    // entry in the shard pulls in the page).
+    if (shard_size < entries_per_page) return;
+
+    for (uint32_t s = 0; s < DEDUP_SHARD_COUNT; s++) {
+        uint32_t base = s * shard_size;
+
+        pthread_mutex_lock(&shard_locks[s].lock);
+        for (uint32_t off = 0;
+             off + entries_per_page <= shard_size;
+             off += (uint32_t)entries_per_page) {
+            dedup_entry_t *start = &table[base + off];
+            int empty = 1;
+            for (size_t k = 0; k < entries_per_page; k++) {
+                if (start[k].ip != 0) { empty = 0; break; }
+            }
+            if (empty) {
+                // DONTNEED is idempotent on an already-reclaimed page,
+                // so calling it on pages that were never dirtied in the
+                // first place is cheap — the kernel just revalidates the
+                // zero-page mapping.
+                madvise(start, page, MADV_DONTNEED);
+            }
+        }
+        pthread_mutex_unlock(&shard_locks[s].lock);
     }
 }
 
@@ -112,15 +185,15 @@ dedup_result_t dedup_check(const server_info_t *info, uint32_t *changed_fields) 
     // contention.
     uint32_t h = key * 2654435761u;
     uint32_t shard = (h >> (32 - DEDUP_SHARD_BITS)) & DEDUP_SHARD_MASK;
-    uint32_t local_idx = h & DEDUP_SHARD_MASKL;
-    uint32_t base = shard * DEDUP_SHARD_SIZE;
+    uint32_t local_idx = h & shard_maskl;
+    uint32_t base = shard * shard_size;
 
     pthread_mutex_t *lk = &shard_locks[shard].lock;
     pthread_mutex_lock(lk);
 
     // Linear probe (max 32 steps) within the shard.
     for (uint32_t probe = 0; probe < 32; probe++) {
-        uint32_t slot = base + ((local_idx + probe) & DEDUP_SHARD_MASKL);
+        uint32_t slot = base + ((local_idx + probe) & shard_maskl);
         dedup_entry_t *e = &table[slot];
 
         if (e->ip == 0) {

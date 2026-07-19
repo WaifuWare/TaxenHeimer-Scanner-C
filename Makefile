@@ -24,8 +24,26 @@ SRCDIR = src
 OBJDIR = obj
 LIBDIR = libs/cJSON
 
+# Optional XDP support. Detected at configure time. If both libbpf and libxdp
+# are installed, the scanner gets the -X / --xdp flag and a compiled BPF
+# object is dropped into $(BUILDDIR)/xdp_filter.bpf.o. Without the deps the
+# scanner still builds; the flag emits a runtime error telling the operator
+# to install libbpf-devel + libxdp-devel + clang.
+HAVE_XDP := $(shell pkg-config --exists libbpf libxdp 2>/dev/null && \
+              command -v clang >/dev/null 2>&1 && echo 1 || echo 0)
+ifeq ($(HAVE_XDP),1)
+  CFLAGS  += -DHAVE_XDP $(shell pkg-config --cflags libbpf libxdp)
+  LDFLAGS += $(shell pkg-config --libs libbpf libxdp)
+  XDP_SOURCE = $(SRCDIR)/engines/xdp.c
+  XDP_BPF_OBJ = $(BUILDDIR)/xdp_filter.bpf.o
+else
+  XDP_SOURCE =
+  XDP_BPF_OBJ =
+endif
+
 # Source files — organized by domain
 SOURCES = $(SRCDIR)/core/main.c \
+          $(SRCDIR)/core/cli.c \
           $(SRCDIR)/core/config.c \
           $(SRCDIR)/core/log.c \
           $(SRCDIR)/scanner/scanner.c \
@@ -34,10 +52,13 @@ SOURCES = $(SRCDIR)/core/main.c \
           $(SRCDIR)/scanner/dedup.c \
           $(SRCDIR)/scanner/priority.c \
           $(SRCDIR)/scanner/hitqueue.c \
-          $(SRCDIR)/scanner/portscan.c \
-          $(SRCDIR)/rawnet/rawscan.c \
-          $(SRCDIR)/rawnet/tcpkt.c \
-          $(SRCDIR)/rawnet/synblast.c \
+          $(SRCDIR)/engines/portscan.c \
+          $(SRCDIR)/engines/iouring.c \
+          $(SRCDIR)/engines/bedrock.c \
+          $(SRCDIR)/engines/rawscan.c \
+          $(SRCDIR)/engines/tcpkt.c \
+          $(SRCDIR)/engines/synblast.c \
+          $(XDP_SOURCE) \
           $(SRCDIR)/protocol/packet.c \
           $(SRCDIR)/net/api.c \
           $(SRCDIR)/ui/ui.c \
@@ -53,7 +74,17 @@ PGO_DIR = $(BUILDDIR)/pgo
 # Default target
 .PHONY: all clean run debug install pgo-generate pgo-use pgo
 
-all: $(TARGET)
+all: $(TARGET) $(XDP_BPF_OBJ)
+
+# Compile the BPF filter with clang. Separate artefact — hot-swappable
+# without relinking the scanner. Only built when libbpf + libxdp + clang
+# are all present at configure time.
+$(BUILDDIR)/xdp_filter.bpf.o: $(SRCDIR)/engines/xdp_filter.bpf.c
+	@mkdir -p $(BUILDDIR)
+	clang -O2 -g -Wall -target bpf \
+	      -D__TARGET_ARCH_x86 \
+	      -c $< -o $@
+	@echo "Built BPF filter: $@"
 
 # Link
 $(TARGET): $(OBJECTS)
@@ -136,7 +167,7 @@ help:
 	@echo "Source layout:"
 	@echo "  src/core/      - main, config, settings, logging"
 	@echo "  src/scanner/   - scan engine, IP ranges, dedup, adaptive timeout"
-	@echo "  src/rawnet/    - kernel-bypass raw socket scanner (--raw/--hybrid mode)"
+	@echo "  src/engines/   - scan mode engines (portscan, iouring, bedrock, rawscan, synblast, tcpkt)"
 	@echo "  src/protocol/  - Minecraft packet codec"
 	@echo "  src/net/       - IPC batch sender"
 	@echo "  src/ui/        - terminal UI, stats"

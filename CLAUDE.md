@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build Commands
 
 ```bash
-make                    # build → build/scanner
+make                    # build → build/scanner (+ xdp_filter.bpf.o if deps present)
 make clean && make      # full rebuild
 make debug              # debug build (-g -O0)
 make run                # build and run
@@ -13,6 +13,11 @@ make help               # show all targets
 
 # Raw/synblast modes need CAP_NET_RAW (stripped by make, re-apply after each build):
 sudo setcap cap_net_raw+ep build/scanner
+
+# XDP mode also needs NET_ADMIN + BPF + PERFMON (verifier pointer-compare):
+sudo setcap cap_net_raw,cap_net_admin,cap_bpf,cap_perfmon+ep build/scanner
+
+# XDP build deps (Fedora): sudo dnf install libbpf-devel libxdp-devel clang
 ```
 
 Nix dev shell: `nix develop` provides clang, gdb, valgrind.
@@ -25,6 +30,9 @@ Nix dev shell: `nix develop` provides clang, gdb, valgrind.
 | `-H` | HYBRID | Kernel connect prescan (1024 concurrent, 300ms) → SLP on hits. Works behind NAT |
 | `-S` | SYNBLAST | Raw SYN prescan via AF_PACKET + BPF → SLP on hits. Needs public IP + CAP_NET_RAW |
 | `-r` | RAW | Full userspace TCP via raw sockets. Needs CAP_NET_RAW |
+| `-u` | IOURING | Async SLP via io_uring (raw syscalls, no liburing dep). Kernel 5.6+, works behind NAT, no caps |
+| `-b` | BEDROCK | UDP Unconnected Ping on port 19132 (RakNet). Works behind NAT, no caps |
+| `-X -i IF` | XDP | eBPF SYN-ACK filter + AF_XDP ring. 5-15× over synblast on native-XDP NIC. Needs libbpf-devel + libxdp-devel + clang + CAP_NET_ADMIN + CAP_BPF |
 
 Range flags: `-k`/`--known` (default, 715 subnets), `-f`/`--full` (all routable IPv4).
 
@@ -41,13 +49,13 @@ prescan thread (portscan or synblast)
           → IPC to Go backend (/tmp/taxenheimer.sock)
 ```
 
-EPOLL/RAW modes skip the prescan — workers scan directly.
+EPOLL/RAW/IOURING/BEDROCK modes skip the prescan — workers scan directly.
 
 ### Module Boundaries
 
 - `src/core/` — main.c (thread pool, CLI, signal handling), config, logging, settings.h (all tunables)
-- `src/scanner/` — epoll-driven SLP scanner, IP ranges, dedup (64MB hash table), priority reorder, subnet stats, portscan prescan, hit queue
-- `src/rawnet/` — raw socket scanner (rawscan), SYN prescan (synblast), TCP packet crafting (tcpkt)
+- `src/scanner/` — default epoll-driven SLP scanner (also hosts shared parsers), IP ranges, dedup (64MB hash table), priority reorder, subnet stats, hit queue
+- `src/engines/` — alternative scan mode engines: `portscan` (hybrid prescan), `iouring`, `bedrock`, `rawscan`, `synblast`, `tcpkt`
 - `src/protocol/` — Minecraft VarInt codec, handshake/status packet construction
 - `src/net/` — IPC batch reporter (framed JSON over Unix socket, bounded concurrency)
 - `src/ui/` — TUI with engine badge, prescan stats row, progress bar, thread-safe logging

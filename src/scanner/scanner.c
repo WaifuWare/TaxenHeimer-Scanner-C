@@ -768,38 +768,44 @@ static int slot_start(slot_t *s, const char *ip, int port, int epfd, uint32_t sl
     return 0;
 }
 
-// Try to parse a complete SLP response from the slot's in_buf.
-// Returns: 1 = parsed successfully (info filled), 0 = need more data, -1 = malformed.
-static int slot_try_parse(slot_t *s) {
-    if (s->in_len == 0) return 0;
+// parse_slp_frame — shared SLP response decoder. Three engines (epoll
+// scanner, io_uring, raw TCP) call this via the scanner.h header so the
+// framing rules only live here. Comment on the header explains the
+// return contract.
+int parse_slp_frame(const uint8_t *buf, size_t len, size_t max_body_len, server_info_t *info) {
+    if (len == 0) return 0;
 
     int32_t pkt_len;
     int consumed;
-    int r = parse_varint_buf(s->in_buf, s->in_len, &pkt_len, &consumed);
+    int r = parse_varint_buf(buf, len, &pkt_len, &consumed);
     if (r <= 0) return r;
-    if (pkt_len <= 0 || (size_t)pkt_len > SLOT_RESP_CAP) return -1;
+    if (pkt_len <= 0 || (size_t)pkt_len > max_body_len) return -1;
 
     size_t header = (size_t)consumed;
-    if (s->in_len < header + (size_t)pkt_len) return 0;  // body incomplete
+    if (len < header + (size_t)pkt_len) return 0;  // body incomplete
 
-    size_t body_start = header;
+    size_t pos = header;
     size_t body_end = header + (size_t)pkt_len;
-    size_t pos = body_start;
 
     int32_t pkt_id;
-    r = parse_varint_buf(s->in_buf + pos, body_end - pos, &pkt_id, &consumed);
+    r = parse_varint_buf(buf + pos, body_end - pos, &pkt_id, &consumed);
     if (r <= 0) return r < 0 ? -1 : 0;
-    pos += consumed;
+    pos += (size_t)consumed;
     if (pkt_id != 0x00) return -1;
 
     int32_t json_len;
-    r = parse_varint_buf(s->in_buf + pos, body_end - pos, &json_len, &consumed);
+    r = parse_varint_buf(buf + pos, body_end - pos, &json_len, &consumed);
     if (r <= 0) return r < 0 ? -1 : 0;
-    pos += consumed;
+    pos += (size_t)consumed;
     if (json_len <= 0 || (size_t)json_len > body_end - pos) return -1;
 
-    int ok = parse_server_json_n((const char *)(s->in_buf + pos), (size_t)json_len, &s->info);
+    int ok = parse_server_json_n((const char *)(buf + pos), (size_t)json_len, info);
     return ok ? 1 : -1;
+}
+
+// slot_try_parse is the epoll-scanner's thin wrapper around parse_slp_frame.
+static int slot_try_parse(slot_t *s) {
+    return parse_slp_frame(s->in_buf, s->in_len, SLOT_RESP_CAP, &s->info);
 }
 
 // Advance a slot given an epoll event. Returns 1 if slot finalized this call.
