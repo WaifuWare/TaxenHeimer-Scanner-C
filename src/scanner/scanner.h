@@ -24,6 +24,18 @@ typedef struct {
     int sample_count;
 } players_t;
 
+// Mod list, populated from the SLP response's `modinfo` (legacy Forge/FML,
+// 1.7-1.12), `forgeData` (modern Forge, 1.13+), or `neoforgeData` (NeoForge)
+// object. mod_loader is "" for unmodded servers. Fabric doesn't advertise a
+// mod list in the standard SLP JSON, so it's never populated here.
+#define MAX_MODS_CAPTURED 64
+typedef struct {
+    char mod_loader[16];              // "forge", "neoforge", "" if unmodded
+    char mods[MAX_MODS_CAPTURED][48]; // mod IDs only — versions/markers dropped
+    int mod_count;                    // number actually captured (<= MAX_MODS_CAPTURED)
+    int mod_count_total;              // total advertised by the server
+} mod_info_t;
+
 // Server information structure. Default shape is the Java SLP payload. The
 // bedrock fields are only populated by the RakNet engine (src/engines/
 // bedrock.c); when bedrock=false the backend ignores them.
@@ -36,6 +48,7 @@ typedef struct {
     char motd[512];
     int protocol;
     players_t players;
+    mod_info_t mod_info;
 
     // Bedrock / RakNet-only fields. Zero-initialised for Java hits.
     bool bedrock;

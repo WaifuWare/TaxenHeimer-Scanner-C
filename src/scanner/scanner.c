@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
@@ -432,6 +433,112 @@ static void sj_read_players(sj_t *s, server_info_t *info) {
     if (s->p < s->end && *s->p == '}') s->p++;
 }
 
+// Extract one mod entry: legacy modList[] uses {"modid":"x","version":"y"},
+// modern forgeData/neoforgeData mods[] uses {"modId":"x","modmarker":"y"}.
+// Only the id is kept.
+static int sj_read_mod_entry(sj_t *s, char *id_out, size_t id_sz) {
+    sj_skip_ws(s);
+    if (s->p >= s->end || *s->p != '{') { sj_skip_value(s); return 0; }
+    s->p++;
+    int got = 0, more = 1;
+    while (more && s->p < s->end && *s->p != '}') {
+        sj_skip_ws(s);
+        if (sj_match_key(s, "modid") || sj_match_key(s, "modId")) {
+            if (sj_parse_string(s, id_out, id_sz) && id_out[0]) got = 1;
+        } else {
+            sj_skip_field(s);
+        }
+        more = sj_after_value(s);
+    }
+    if (s->p < s->end && *s->p == '}') s->p++;
+    return got;
+}
+
+// Shared by legacy modList[] and modern forgeData/neoforgeData mods[]:
+// reads an array of mod entries, capping storage at MAX_MODS_CAPTURED while
+// still counting the true total.
+static void sj_read_mod_array(sj_t *s, mod_info_t *mi) {
+    sj_skip_ws(s);
+    if (s->p >= s->end || *s->p != '[') { sj_skip_value(s); return; }
+    s->p++;
+    sj_skip_ws(s);
+    int more = 1;
+    while (more && s->p < s->end && *s->p != ']') {
+        char id[48] = {0};
+        if (sj_read_mod_entry(s, id, sizeof(id))) {
+            mi->mod_count_total++;
+            if (mi->mod_count < MAX_MODS_CAPTURED) {
+                strncpy(mi->mods[mi->mod_count], id, sizeof(mi->mods[0]) - 1);
+                mi->mods[mi->mod_count][sizeof(mi->mods[0]) - 1] = '\0';
+                mi->mod_count++;
+            }
+        }
+        sj_skip_ws(s);
+        if (s->p < s->end && *s->p == ',') { s->p++; more = 1; } else more = 0;
+        sj_skip_ws(s);
+    }
+    if (s->p < s->end && *s->p == ']') s->p++;
+}
+
+// NeoForge servers still often report "forgeData" for backward compat with
+// generic pingers, but always include a synthetic "neoforge" entry in the
+// mods list — that's a more reliable signal than which top-level key was
+// used, so re-check it regardless of how we got here.
+static void mod_info_relabel_neoforge(mod_info_t *mi) {
+    for (int i = 0; i < mi->mod_count; i++) {
+        if (strcasecmp(mi->mods[i], "neoforge") == 0) {
+            strncpy(mi->mod_loader, "neoforge", sizeof(mi->mod_loader) - 1);
+            mi->mod_loader[sizeof(mi->mod_loader) - 1] = '\0';
+            return;
+        }
+    }
+}
+
+// Legacy FML (Forge 1.7-1.12): {"type":"FML","modList":[...]}
+static void sj_read_modinfo(sj_t *s, mod_info_t *mi) {
+    sj_skip_ws(s);
+    if (s->p >= s->end || *s->p != '{') { sj_skip_value(s); return; }
+    s->p++;
+    int more = 1;
+    while (more && s->p < s->end && *s->p != '}') {
+        sj_skip_ws(s);
+        if (sj_match_key(s, "modList")) {
+            sj_read_mod_array(s, mi);
+        } else {
+            sj_skip_field(s);
+        }
+        more = sj_after_value(s);
+    }
+    if (s->p < s->end && *s->p == '}') s->p++;
+    if (mi->mod_count_total > 0 && mi->mod_loader[0] == '\0') {
+        strncpy(mi->mod_loader, "forge", sizeof(mi->mod_loader) - 1);
+    }
+}
+
+// Modern FML2/3 (Forge 1.13+, NeoForge): {"channels":[...],"mods":[...],...}.
+// loader_name is the default label for the top-level key that got us here;
+// mod_info_relabel_neoforge can still override it to "neoforge".
+static void sj_read_forgedata(sj_t *s, mod_info_t *mi, const char *loader_name) {
+    sj_skip_ws(s);
+    if (s->p >= s->end || *s->p != '{') { sj_skip_value(s); return; }
+    s->p++;
+    int more = 1;
+    while (more && s->p < s->end && *s->p != '}') {
+        sj_skip_ws(s);
+        if (sj_match_key(s, "mods")) {
+            sj_read_mod_array(s, mi);
+        } else {
+            sj_skip_field(s);
+        }
+        more = sj_after_value(s);
+    }
+    if (s->p < s->end && *s->p == '}') s->p++;
+    if (mi->mod_loader[0] == '\0') {
+        strncpy(mi->mod_loader, loader_name, sizeof(mi->mod_loader) - 1);
+    }
+    mod_info_relabel_neoforge(mi);
+}
+
 int parse_server_json_n(const char *json_buf, size_t json_len, server_info_t *info) {
     if (!json_buf) return 0;
     sj_t s = { .p = json_buf, .end = json_buf + json_len };
@@ -448,6 +555,12 @@ int parse_server_json_n(const char *json_buf, size_t json_len, server_info_t *in
             sj_read_version(&s, info);
         } else if (sj_match_key(&s, "players")) {
             sj_read_players(&s, info);
+        } else if (sj_match_key(&s, "modinfo")) {
+            sj_read_modinfo(&s, &info->mod_info);
+        } else if (sj_match_key(&s, "forgeData")) {
+            sj_read_forgedata(&s, &info->mod_info, "forge");
+        } else if (sj_match_key(&s, "neoforgeData")) {
+            sj_read_forgedata(&s, &info->mod_info, "neoforge");
         } else {
             sj_skip_field(&s);
         }
