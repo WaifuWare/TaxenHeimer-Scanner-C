@@ -373,6 +373,18 @@ static int send_batch_ipc(const batch_t *batch) {
             jb_putc(&jb, '}');
         }
         jb_literal(&jb, "]");
+        if (s->mod_info.mod_loader[0]) {
+            jb_literal(&jb, ",\"mod_loader\":");
+            jb_str(&jb, s->mod_info.mod_loader);
+            jb_literal(&jb, ",\"mod_count\":");
+            jb_int(&jb, s->mod_info.mod_count_total);
+            jb_literal(&jb, ",\"mods\":[");
+            for (int j = 0; j < s->mod_info.mod_count; j++) {
+                if (j > 0) jb_putc(&jb, ',');
+                jb_str(&jb, s->mod_info.mods[j]);
+            }
+            jb_literal(&jb, "]");
+        }
         if (s->bedrock) {
             jb_literal(&jb, ",\"motd2\":");
             jb_str(&jb, s->motd2);
